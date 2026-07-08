@@ -10,7 +10,8 @@ use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::message::{
-    self, CasReq, CasRes, ClientResponse, KvEvent, KvRequest, Outgoing, ReadReq, ReadRes,
+    self, CasReq, CasRes, ClientResponse, InterNodeReq, KvEvent, KvRequest, Outgoing, ReadReq,
+    ReadRes,
 };
 
 #[derive(Debug, Error)]
@@ -141,11 +142,29 @@ impl Transport {
         in_reply_to: usize,
         dest: String,
     ) -> Result<(), TransportErr> {
+        let msg_id = self.msg_id.fetch_add(1, atomic::Ordering::Relaxed) as usize;
         self.write_tx
             .send(Outgoing::ClientResponse {
                 res,
+                msg_id,
                 in_reply_to,
                 dest,
+            })
+            .await
+            .map_err(|_| TransportErr::ChanSend("write_tx"))
+    }
+
+    pub async fn send_internode_req(
+        &self,
+        dest: &String,
+        req: InterNodeReq,
+    ) -> Result<(), TransportErr> {
+        let msg_id = self.msg_id.fetch_add(1, atomic::Ordering::Relaxed) as usize;
+        self.write_tx
+            .send(Outgoing::InterNodeReq {
+                req,
+                msg_id,
+                dest: dest.to_string(),
             })
             .await
             .map_err(|_| TransportErr::ChanSend("write_tx"))

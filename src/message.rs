@@ -62,6 +62,26 @@ pub enum Payload {
         code: u8,
         text: String,
     },
+    GossipDigest {
+        digest: HashMap<String, usize>,
+    },
+    GossipDiff {
+        msgs: HashMap<String, Vec<(usize, Vec<u32>)>>,
+    },
+}
+
+pub enum InterNodeReq {
+    GossipDigest(GossipDigestReq),
+    GossipDiff(GossipDiffReq),
+}
+
+pub struct GossipDigestReq {
+    pub src: String,
+    pub digest: HashMap<String, usize>,
+}
+
+pub struct GossipDiffReq {
+    pub msgs: HashMap<String, Vec<(usize, Vec<u32>)>>,
 }
 
 pub enum ClientRequest {
@@ -143,6 +163,7 @@ impl KvEvent {
 pub enum Incoming {
     ClientRequest(ClientRequest),
     KvEvent(KvEvent),
+    NodeRequest(InterNodeReq),
 }
 
 pub enum Outgoing {
@@ -151,8 +172,14 @@ pub enum Outgoing {
         msg_id: usize,
     },
     ClientResponse {
+        msg_id: usize,
         res: ClientResponse,
         in_reply_to: usize,
+        dest: String,
+    },
+    InterNodeReq {
+        req: InterNodeReq,
+        msg_id: usize,
         dest: String,
     },
 }
@@ -221,30 +248,50 @@ impl From<ClientResponse> for Payload {
     }
 }
 
+impl From<InterNodeReq> for Payload {
+    fn from(req: InterNodeReq) -> Self {
+        match req {
+            InterNodeReq::GossipDigest(GossipDigestReq { digest, .. }) => {
+                Payload::GossipDigest { digest }
+            }
+            InterNodeReq::GossipDiff(GossipDiffReq { msgs }) => Payload::GossipDiff { msgs },
+        }
+    }
+}
+
 impl Outgoing {
     pub fn into_msg(self, node_id: &str) -> Msg<Payload> {
         match self {
             Outgoing::KvRequest { req, msg_id } => Msg {
                 src: node_id.to_string(),
-                dest: "lin-kv".into(),
+                dest: "lin-kv".to_string(),
                 body: Body {
                     id: Some(msg_id),
                     in_reply_to: None,
                     payload: req.into(),
                 },
             },
-
             Outgoing::ClientResponse {
                 res,
                 in_reply_to,
                 dest,
+                msg_id,
             } => Msg {
-                src: node_id.into(),
+                src: node_id.to_string(),
                 dest,
                 body: Body {
-                    id: None,
+                    id: Some(msg_id),
                     in_reply_to: Some(in_reply_to),
                     payload: res.into(),
+                },
+            },
+            Outgoing::InterNodeReq { req, dest, msg_id } => Msg {
+                src: node_id.to_string(),
+                dest,
+                body: Body {
+                    id: Some(msg_id),
+                    payload: req.into(),
+                    in_reply_to: None,
                 },
             },
         }
@@ -284,7 +331,6 @@ impl Msg<Payload> {
                     src,
                 })))
             }
-
             Payload::Poll { offsets } => {
                 let msg_id = self.body.id.ok_or(DropReason::NoMsgId)?;
                 let src = self.src;
@@ -305,7 +351,6 @@ impl Msg<Payload> {
                     },
                 )))
             }
-
             Payload::ListCommittedOffsets { keys } => {
                 let msg_id = msg_id.ok_or(DropReason::NoMsgId)?;
                 let src = self.src;
@@ -313,14 +358,12 @@ impl Msg<Payload> {
                     ClientRequest::ListCommittedOffsets(ListReq { keys, msg_id, src }),
                 ))
             }
-
             Payload::CasOk => {
                 let in_reply_to = self.body.in_reply_to.ok_or(DropReason::NoInReplyTo)?;
                 Ok(Incoming::KvEvent(KvEvent::CasRes(CasRes::Ok(CasOkRes {
                     in_reply_to,
                 }))))
             }
-
             Payload::ReadOk { value } => {
                 let in_reply_to = self.body.in_reply_to.ok_or(DropReason::NoInReplyTo)?;
                 Ok(Incoming::KvEvent(KvEvent::ReadRes(ReadRes {
@@ -328,7 +371,6 @@ impl Msg<Payload> {
                     value,
                 })))
             }
-
             Payload::Error { code, text } => {
                 let in_reply_to = self.body.in_reply_to.ok_or(DropReason::NoInReplyTo)?;
 
@@ -343,7 +385,15 @@ impl Msg<Payload> {
 
                 Ok(Incoming::KvEvent(KvEvent::CasRes(event)))
             }
-
+            Payload::GossipDigest { digest } => {
+                let src = self.src;
+                Ok(Incoming::NodeRequest(InterNodeReq::GossipDigest(
+                    GossipDigestReq { digest, src },
+                )))
+            }
+            Payload::GossipDiff { msgs } => Ok(Incoming::NodeRequest(InterNodeReq::GossipDiff(
+                GossipDiffReq { msgs },
+            ))),
             Payload::SendOk { .. }
             | Payload::PollOk { .. }
             | Payload::CommitOffsetsOk
