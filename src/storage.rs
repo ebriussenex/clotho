@@ -129,7 +129,7 @@ impl LogStore {
 
                 let offset = log.iter().take_while(|msg| msg.is_some()).count();
                 if offset == 0 {
-                    return None;
+                    None
                 } else {
                     Some((key.clone(), offset - 1))
                 }

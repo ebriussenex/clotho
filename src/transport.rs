@@ -109,10 +109,10 @@ impl Transport {
 
         let rx = self.pending.add_cas(msg_id).await;
 
-        Ok((tokio::time::timeout(self.timeout, rx)
+        (tokio::time::timeout(self.timeout, rx)
             .await
             .map_err(|_| TransportErr::TimeoutRx("cas"))?)
-        .map_err(|_| TransportErr::SenderDropped("cas_tx"))?)
+        .map_err(|_| TransportErr::SenderDropped("cas_tx"))
     }
 
     pub async fn rpc_read(&self, req: &ReadReq) -> Result<usize, TransportErr> {
