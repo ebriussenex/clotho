@@ -50,7 +50,8 @@ impl PendingTable {
 
         if let Entry::Occupied(entry) = cast.entry(msg_id) {
             let tx = entry.remove();
-            tx.send(res);
+            tx.send(res)
+                .map_err(|_| TransportErr::ChanSend("write_tx: reg_cas"))?;
         } else {
             return Err(TransportErr::NotAwaited);
         }
@@ -65,11 +66,12 @@ impl PendingTable {
     }
 
     async fn reg_read(&self, msg_id: usize, res: ReadRes) -> Result<(), TransportErr> {
-        let mut cast = self.kv_read.lock().await;
+        let mut kv_read_m = self.kv_read.lock().await;
 
-        if let Entry::Occupied(entry) = cast.entry(msg_id) {
+        if let Entry::Occupied(entry) = kv_read_m.entry(msg_id) {
             let tx = entry.remove();
-            tx.send(res);
+            tx.send(res)
+                .map_err(|_| TransportErr::ChanSend("write_tx: reg_read"))?;
         } else {
             return Err(TransportErr::NotAwaited);
         }
@@ -95,6 +97,7 @@ impl Transport {
             pending: PendingTable::new(),
         }
     }
+
     pub async fn rpc_cas(&self, req: &CasReq) -> Result<CasRes, TransportErr> {
         let msg_id = self.msg_id.fetch_add(1, atomic::Ordering::Relaxed) as usize;
         let req = Outgoing::KvRequest {

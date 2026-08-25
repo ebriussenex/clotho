@@ -3,7 +3,7 @@ use crate::{
     message::{
         self, CasReq, CasResUnknown, ClientRequest, ClientResponse, CommitReq, DropReason,
         GossipDiffReq, GossipDigestReq, Incoming, InterNodeReq, KvEvent, ListCommittedOffsetsOkRes,
-        ListReq, PollOkRes, PollReq, ReadReq, SendReq,
+        ListReq, PollOkRes, PollReq, ReadReq, SendOkRes, SendReq,
     },
     storage::{Logs, StorageErr},
     transport::{Transport, TransportErr},
@@ -352,11 +352,15 @@ async fn handle_send(logs: Logs, req: SendReq, transport: Transport) -> Result<(
         to: next_offset + 1,
     };
 
-    let offset = rpc_cas(cas_req, transport).await?;
+    let offset = rpc_cas(cas_req, transport.clone()).await?;
 
-    logs.append(key, req.msg, offset)
-        .await
-        .map_err(HandleErr::Storage)?;
+    logs.append(key, req.msg, offset).await?;
+
+    let res = ClientResponse::SendOk(SendOkRes { offset });
+
+    transport
+        .send_client_response(res, req.msg_id, req.src)
+        .await?;
     Ok(())
 }
 
@@ -381,12 +385,12 @@ async fn handle_commit_offsets(
 
 async fn rpc_cas(mut cas_req: CasReq, transport: Transport) -> Result<usize, HandleErr> {
     loop {
-        let next_offset = cas_req.to;
+        let offset = cas_req.from;
         let key = cas_req.key.clone();
         let cas_res = transport.rpc_cas(&cas_req).await?;
 
         match cas_res {
-            message::CasRes::Ok(_) => return Ok(next_offset),
+            message::CasRes::Ok(_) => return Ok(offset),
             message::CasRes::Retry(_) => {
                 let latest_offset = transport.rpc_read(&ReadReq { key }).await?;
 

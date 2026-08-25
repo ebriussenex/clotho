@@ -10,8 +10,11 @@ mod storage;
 mod transport;
 
 fn init_tracing() {
+    use std::io::IsTerminal;
+
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
         .init()
 }
 
