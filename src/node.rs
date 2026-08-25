@@ -1,8 +1,9 @@
 use crate::{
+    io::{IoError, MessageReader, MessageWriter},
     message::{
         self, CasReq, CasResUnknown, ClientRequest, ClientResponse, CommitReq, DropReason,
         GossipDiffReq, GossipDigestReq, Incoming, InterNodeReq, KvEvent, ListCommittedOffsetsOkRes,
-        ListReq, Msg, Outgoing, Payload, PollOkRes, PollReq, ReadReq, SendReq,
+        ListReq, PollOkRes, PollReq, ReadReq, SendReq,
     },
     storage::{Logs, StorageErr},
     transport::{Transport, TransportErr},
@@ -10,11 +11,9 @@ use crate::{
 
 use std::{
     collections::{HashMap, hash_map::Entry},
-    io::Write,
     sync::Arc,
 };
 
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
     sync::mpsc::{self},
@@ -25,25 +24,6 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Error)]
 pub enum NodeErr {
-    #[error("failed to read init msg: {0}")]
-    ReadInit(#[source] std::io::Error),
-    #[error("no init message")]
-    NoInitMsg,
-    #[error("failed to deserialize init msg: {0}")]
-    InitMsgDeserialize(#[source] serde_json::Error),
-    #[error("failed to write to stdout: {0}")]
-    Write(#[source] std::io::Error),
-    #[error("failed to read line from stdin")]
-    ReadStdIn(#[source] std::io::Error),
-    #[error("failed to serialize msg: {0}")]
-    Serialize(#[source] serde_json::Error),
-    #[error("failed to deserialize msg: {0}")]
-    Deserialize(#[source] serde_json::Error),
-    #[error{"no \"id\" in {0} msg"}]
-    NoId(String),
-    #[error("failed to send to {0} channel")]
-    ChanSend(&'static str),
-
     #[error(transparent)]
     Handle(#[from] HandleErr),
     #[error(transparent)]
@@ -54,15 +34,10 @@ pub enum NodeErr {
 pub enum MsgErr {
     #[error("missing field in incoming message: {0}")]
     MissingField(&'static str),
-    #[error("no \"in_reply_to\" in {0} msg")]
-    NoReply(&'static str),
 }
 
 #[derive(Debug, Error)]
 pub enum HandleErr {
-    #[error("not found log by key")]
-    KeyNotFound,
-
     #[error("failed to send to {0} channel")]
     ChanSend(&'static str),
     #[error("unexpected cas result: code: {code} text: {text}")]
@@ -73,28 +48,8 @@ pub enum HandleErr {
     Transport(#[from] TransportErr),
     #[error(transparent)]
     Msg(#[from] MsgErr),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-#[serde(rename_all = "snake_case")]
-pub enum InitPayload {
-    Init(Init),
-    InitOk,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Init {
-    node_id: String,
-    node_ids: Vec<String>,
-}
-
-pub struct Node<W: Write + Send + 'static> {
-    node_id: String,
-    node_ids: Vec<String>,
-    writer: Arc<tokio::sync::Mutex<W>>,
-    commited_offsets: Arc<tokio::sync::RwLock<HashMap<String, usize>>>,
-    config: Config,
+    #[error(transparent)]
+    Io(#[from] IoError),
 }
 
 pub struct Config {
@@ -104,36 +59,13 @@ pub struct Config {
     gossip_digest_interval: Duration,
 }
 
-pub trait MessageReader: Send + 'static {
-    fn next(&mut self)
-    -> impl Future<Output = Result<Option<Msg<Payload>>, HandleErr>> + Send + '_;
-}
-
-pub trait MessageWriter: Send + 'static {
-    fn send(
-        &mut self,
-        msg: Outgoing,
-        node_id: &str,
-    ) -> impl Future<Output = Result<(), HandleErr>> + Send;
-}
-
-impl<W: Write + Send + 'static> Node<W> {
-    pub fn new(writer: Arc<tokio::sync::Mutex<W>>, init_msg: Msg<Init>, config: Config) -> Self {
-        let node_id = init_msg.body.payload.node_id;
-        let node_ids: Vec<_> = init_msg
-            .body
-            .payload
-            .node_ids
-            .into_iter()
-            .filter(|n_id| **n_id != node_id)
-            .collect();
-
-        Self {
-            node_id,
-            writer,
-            config,
-            node_ids,
-            commited_offsets: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            poll_max_msgs_size: 100,
+            request_timeout: Duration::from_millis(1000),
+            gossip_diff_interval: Duration::from_millis(1000),
+            gossip_digest_interval: Duration::from_millis(1000),
         }
     }
 }
@@ -214,7 +146,6 @@ where
         let logs = logs.clone();
         let node_ids = node_ids.clone();
         let token = token.clone();
-
         async move {
             gossip_diff(
                 token,
@@ -266,6 +197,7 @@ where
 
     token.cancel();
     while join_set.join_next().await.is_some() {}
+
     Ok(())
 }
 
@@ -277,11 +209,13 @@ async fn receive_and_dispatch(
     mut reader: impl MessageReader,
 ) -> Result<(), HandleErr> {
     loop {
-        tokio::select! {
+        let msg = tokio::select! {
             _ = token.cancelled() => return Ok(()),
-            msg = reader.next() => {
-               match msg? {
-                Some(msg) => {match msg.classify() {
+            msg = reader.next() => msg,
+        };
+
+        match msg? {
+            Some(msg) => match msg.classify() {
                 Ok(msg) => match msg {
                     Incoming::ClientRequest(client_request) => client_tx
                         .send(client_request)
@@ -298,14 +232,13 @@ async fn receive_and_dispatch(
                 },
                 Err(reason) => match reason {
                     DropReason::NoMsgId => Err(HandleErr::Msg(MsgErr::MissingField("msg_id")))?,
-                    DropReason::NoInReplyTo => Err(HandleErr::Msg(MsgErr::MissingField("in_reply_to")))?,
-                    DropReason::Ignored => {}
+                    DropReason::NoInReplyTo => {
+                        Err(HandleErr::Msg(MsgErr::MissingField("in_reply_to")))?
+                    }
+                    DropReason::Ignored => (),
                 },
-            }},
-                None => return Ok(()),
-            }
-
-        }
+            },
+            None => return Ok(()),
         }
     }
 }
@@ -319,13 +252,16 @@ async fn process_client_requests(
     poll_max_msgs_size: usize,
 ) -> Result<(), HandleErr> {
     loop {
-        tokio::select! {
-                _ = token.cancelled() => return Ok(()),
-                req = client_rx.recv() => {
-                    match req {
-                        Some(req) => {
-            match req {
-                ClientRequest::Send(req) => handle_send(logs.clone(), req, transport.clone()).await?,
+        let req = tokio::select! {
+            _ = token.cancelled() => return Ok(()),
+            req = client_rx.recv() => req,
+        };
+
+        match req {
+            Some(req) => match req {
+                ClientRequest::Send(req) => {
+                    handle_send(logs.clone(), req, transport.clone()).await?
+                }
                 ClientRequest::Poll(req) => {
                     handle_poll(logs.clone(), req, transport.clone(), poll_max_msgs_size).await?
                 }
@@ -336,11 +272,8 @@ async fn process_client_requests(
                     handle_list_commited_offsets(commited_offsets.clone(), transport.clone(), req)
                         .await?
                 }
-            }
-                        },
-                        None => return Ok(())
-                    }},
-
+            },
+            None => return Ok(()),
         }
     }
 }
@@ -351,16 +284,14 @@ async fn process_kv_events(
     transport: Transport,
 ) -> Result<(), HandleErr> {
     loop {
-        tokio::select! {
-            _ = token.cancelled() => {return Ok(())},
-            event = kv_rx.recv() => {
-                match event {
-                    Some(event) => {
-                        transport.register_kv_event(event).await?;
-                    },
-                    None => return Ok(()),
-                }
-            }
+        let event = tokio::select! {
+            _ = token.cancelled() => return Ok(()),
+            event = kv_rx.recv() => event,
+        };
+
+        match event {
+            Some(event) => transport.register_kv_event(event).await?,
+            None => return Ok(()),
         }
     }
 }
@@ -372,14 +303,14 @@ async fn write(
     node_id: Arc<str>,
 ) -> Result<(), HandleErr> {
     loop {
-        tokio::select! {
-            _ = token.cancelled() => {},
-            msg = write_rx.recv() => {
-                match msg {
-                    Some(msg) => writer.send(msg, &node_id).await?,
-                    None => return Ok(()),
-                }
-            }
+        let msg = tokio::select! {
+            _ = token.cancelled() => return Ok(()),
+            msg = write_rx.recv() => msg,
+        };
+
+        match msg {
+            Some(msg) => writer.send(msg.into_msg(&node_id)).await?,
+            None => return Ok(()),
         }
     }
 }
@@ -478,22 +409,28 @@ async fn process_internode(
     observed_offsets: Arc<tokio::sync::RwLock<HashMap<String, HashMap<String, usize>>>>,
 ) -> Result<(), HandleErr> {
     loop {
-        tokio::select! {
-            _ = token.cancelled() => {
-                return Ok(())
-            },
-            req = internode_rx.recv() => {
-                match req {
-                    Some(req) => match req {
-                        InterNodeReq::GossipDigest(digest_req) => {
-                            handle_digest(observed_offsets.clone(), digest_req).await?
-                        }
-                        InterNodeReq::GossipDiff(diff_req) => handle_diff(&mut logs, diff_req).await?,
-        },
-                    None => return Ok(()),
-                }
-            }
+        let req = tokio::select! {
+            _ = token.cancelled() => return Ok(()),
+            req = internode_rx.recv() => req,
+        };
+
+        match req {
+            Some(req) => handle_internode_req(req, &mut logs, &observed_offsets).await?,
+            None => return Ok(()),
         }
+    }
+}
+
+async fn handle_internode_req(
+    req: InterNodeReq,
+    logs: &mut Logs,
+    observed_offsets: &Arc<tokio::sync::RwLock<HashMap<String, HashMap<String, usize>>>>,
+) -> Result<(), HandleErr> {
+    match req {
+        InterNodeReq::GossipDigest(digest_req) => {
+            handle_digest(observed_offsets.clone(), digest_req).await
+        }
+        InterNodeReq::GossipDiff(diff_req) => handle_diff(logs, diff_req).await,
     }
 }
 
@@ -530,21 +467,23 @@ async fn gossip_diff(
     let mut interval = tokio::time::interval(interval);
     loop {
         tokio::select! {
-            _ = token.cancelled() => { return Ok(()); },
-            _ = interval.tick() => {
-                let observed_offsets = observed_offsets.read().await;
-                for dest in node_ids.iter() {
-                   if let Some(observed_offset) = observed_offsets.get(dest)  {
-                       let diff = logs.diff(observed_offset.clone()).await;
-                       let req = InterNodeReq::GossipDiff(
-                           GossipDiffReq { msgs: diff }
-                       );
-                       transport.send_internode_req(dest, req).await.map_err(HandleErr::Transport)?;
-                   }
-                   continue;
-                }
-            },
-        };
+            _ = token.cancelled() => return Ok(()),
+            _ = interval.tick() => {},
+        }
+
+        let observed_offsets = observed_offsets.read().await;
+        for dest in node_ids.iter() {
+            let Some(observed_offset) = observed_offsets.get(dest) else {
+                continue;
+            };
+
+            let diff = logs.diff(observed_offset.clone()).await;
+            let req = InterNodeReq::GossipDiff(GossipDiffReq { msgs: diff });
+            transport
+                .send_internode_req(dest, req)
+                .await
+                .map_err(HandleErr::Transport)?;
+        }
     }
 }
 
@@ -559,18 +498,19 @@ async fn gossip_digest(
     let mut interval = tokio::time::interval(interval);
     loop {
         tokio::select! {
-            _ = token.cancelled() => { return Ok(()); },
-            _ = interval.tick() => {
-                    for dest in node_ids.iter() {
-                        let req = InterNodeReq::GossipDigest(
-                            GossipDigestReq { digest: logs.digest().await, src: src.to_string() }
-                        );
-                        transport
-                            .send_internode_req(dest,req)
-                            .await
-                            .map_err(HandleErr::Transport)?;
-                    }
-            }
-        };
+            _ = token.cancelled() => return Ok(()),
+            _ = interval.tick() => {},
+        }
+
+        for dest in node_ids.iter() {
+            let req = InterNodeReq::GossipDigest(GossipDigestReq {
+                digest: logs.digest().await,
+                src: src.to_string(),
+            });
+            transport
+                .send_internode_req(dest, req)
+                .await
+                .map_err(HandleErr::Transport)?;
+        }
     }
 }

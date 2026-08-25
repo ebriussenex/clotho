@@ -1,32 +1,43 @@
-use std::time::Duration;
+use crate::{io::stdio::StdioReader, io::stdio::StdioWriter, node::Config};
 
-use crate::{
-    message::{Msg, Payload},
-    node::{HandleErr, MessageReader, NodeErr},
-};
+use tokio::{self};
 
+mod io;
+mod maelstrom;
 mod message;
 mod node;
 mod storage;
 mod transport;
 
-pub struct StdinReader {
-    lines: tokio::io::Lines<tokio::io::BufReader<tokio::io::Stdin>>,
+fn init_tracing() {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init()
 }
 
-//impl MessageReader for StdinReader {
-//    async fn next(&mut self) -> Result<Option<Msg<Payload>>, HandleErr> {
-//        match self.lines.next_line().await.map_err(HandleErr::ReadStdIn)? {
-//            Some(line) => Ok(Some(
-//                serde_json::from_str(&line).map_err(HandleErr::Deserialize)?,
-//            )),
-//            None => Ok(None),
-//        }
-//    }
-//}
-//
 #[tokio::main]
 async fn main() {
-    //let _ = node::process(node::Config {}) .await
-    //    .inspect_err(|e| println!("processing failed: {e}"));
+    init_tracing();
+
+    let mut msg_reader = StdioReader::default();
+    let mut msg_writer = StdioWriter::default();
+    let config = Config::default();
+
+    let (node_id, node_ids) = match maelstrom::handshake(&mut msg_reader, &mut msg_writer).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, "handshake failed");
+            std::process::exit(1);
+        }
+    };
+
+    tracing::info!(node_id = %node_id, peers = ?node_ids, "node initialized");
+
+    match node::run(config, node_id, node_ids, msg_reader, msg_writer).await {
+        Ok(_) => tracing::info!("node shutdown successfully"),
+        Err(e) => {
+            tracing::error!(error = %e, "node run failed");
+            std::process::exit(1);
+        }
+    }
 }
