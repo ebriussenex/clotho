@@ -105,12 +105,11 @@ impl Transport {
             msg_id,
         };
 
+        let rx = self.pending.add_cas(msg_id).await;
         self.write_tx
             .send(req)
             .await
             .map_err(|_| TransportErr::ChanSend("write_tx: cas"))?;
-
-        let rx = self.pending.add_cas(msg_id).await;
 
         (tokio::time::timeout(self.timeout, rx)
             .await
@@ -125,12 +124,11 @@ impl Transport {
             msg_id,
         };
 
+        let rx = self.pending.add_read(msg_id).await;
         self.write_tx
             .send(req)
             .await
             .map_err(|_| TransportErr::ChanSend("write_tx: read"))?;
-
-        let rx = self.pending.add_read(msg_id).await;
 
         Ok((tokio::time::timeout(self.timeout, rx)
             .await
