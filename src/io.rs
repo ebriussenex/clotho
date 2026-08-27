@@ -3,7 +3,7 @@ pub mod stdio;
 use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
-use crate::{io::stdio::StdioErr, message::Msg};
+use crate::{io::stdio::StdioErr, protocol::maelstrom::Msg};
 
 #[derive(Debug, Error)]
 pub enum IoError {

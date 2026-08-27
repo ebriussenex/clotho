@@ -4,7 +4,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines, Stdin};
 
 use crate::{
     io::{IoError, MessageReader, MessageWriter},
-    message::Msg,
+    protocol::maelstrom::Msg,
 };
 
 #[derive(Debug, Error)]

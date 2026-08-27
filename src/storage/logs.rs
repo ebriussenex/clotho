@@ -76,24 +76,6 @@ impl LogStore {
             .collect()
     }
 
-    fn poll_offset(&self, offsets: HashMap<String, usize>) -> HashMap<String, (usize, Vec<u32>)> {
-        offsets
-            .into_iter()
-            .filter_map(|(key, offset)| {
-                if let Some(log) = self.logs.get(&key) {
-                    let msgs = log
-                        .iter()
-                        .skip(offset)
-                        .map_while(|msg| *msg)
-                        .collect::<Vec<_>>();
-                    Some((key, (offset, msgs)))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
     fn merge(&mut self, other: HashMap<String, Vec<(usize, Vec<u32>)>>) -> Result<(), StorageErr> {
         for (key, sparsed_msgs) in other.into_iter() {
             let log = self.logs.entry(key).or_default();
@@ -193,13 +175,6 @@ impl Logs {
         limit: usize,
     ) -> HashMap<String, Vec<(usize, u32)>> {
         self.inner.read().await.poll(offsets, limit)
-    }
-
-    pub async fn poll_offset(
-        &self,
-        offsets: HashMap<String, usize>,
-    ) -> HashMap<String, (usize, Vec<u32>)> {
-        self.inner.read().await.poll_offset(offsets)
     }
 
     pub async fn merge(

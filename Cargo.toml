@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+backon = "1.6.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2.0.20"
@@ -11,3 +12,4 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7.19"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wyhash = "0.6.0"

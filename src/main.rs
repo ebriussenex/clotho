@@ -2,10 +2,16 @@ use crate::{io::stdio::StdioReader, io::stdio::StdioWriter, node::Config};
 
 use tokio::{self};
 
+mod app;
+mod domain;
 mod io;
-mod maelstrom;
+mod kv;
 mod message;
 mod node;
+mod offsets;
+mod protocol;
+mod replication;
+mod retry;
 mod storage;
 mod transport;
 
@@ -26,13 +32,14 @@ async fn main() {
     let mut msg_writer = StdioWriter::default();
     let config = Config::default();
 
-    let (node_id, node_ids) = match maelstrom::handshake(&mut msg_reader, &mut msg_writer).await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!(error = %e, "handshake failed");
-            std::process::exit(1);
-        }
-    };
+    let (node_id, node_ids) =
+        match protocol::init::handshake(&mut msg_reader, &mut msg_writer).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(error = %e, "handshake failed");
+                std::process::exit(1);
+            }
+        };
 
     tracing::info!(node_id = %node_id, peers = ?node_ids, "node initialized");
 

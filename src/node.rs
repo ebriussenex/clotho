@@ -1,24 +1,21 @@
 use crate::{
+    app::{App, AppErr, ClientRequest},
     io::{IoError, MessageReader, MessageWriter},
-    message::{
-        self, CasReq, CasResUnknown, ClientRequest, ClientResponse, CommitReq, DropReason,
-        GossipDiffReq, GossipDigestReq, Incoming, InterNodeReq, KvEvent, ListCommittedOffsetsOkRes,
-        ListReq, PollOkRes, PollReq, ReadReq, SendOkRes, SendReq,
-    },
-    storage::{Logs, StorageErr},
+    kv::KvEvent,
+    message::{self, DropReason, Incoming},
+    offsets::store::CommitedOffsets,
+    replication::{Replication, ReplicationErr, ReplicationRequest},
+    retry::RetryPolicy,
+    storage::Logs,
     transport::{Transport, TransportErr},
 };
 
-use std::{
-    collections::{HashMap, hash_map::Entry},
-    sync::Arc,
-};
+use std::{sync::Arc, time::Duration};
 
 use thiserror::Error;
 use tokio::{
     sync::mpsc::{self},
     task::JoinSet,
-    time::Duration,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -38,12 +35,15 @@ pub enum MsgErr {
 
 #[derive(Debug, Error)]
 pub enum HandleErr {
-    #[error("failed to send to {0} channel")]
-    ChanSend(&'static str),
-    #[error("unexpected cas result: code: {code} text: {text}")]
-    UnexpectedCas { code: u8, text: String },
+    #[error("failed to send {item} to {channel} channel")]
+    ChanSend {
+        channel: &'static str,
+        item: &'static str,
+    },
     #[error(transparent)]
-    Storage(#[from] StorageErr),
+    App(#[from] AppErr),
+    #[error(transparent)]
+    Replication(#[from] ReplicationErr),
     #[error(transparent)]
     Transport(#[from] TransportErr),
     #[error(transparent)]
@@ -52,11 +52,20 @@ pub enum HandleErr {
     Io(#[from] IoError),
 }
 
+impl HandleErr {
+    fn chan_send(channel: &'static str, item: &'static str) -> Self {
+        tracing::error!(channel, item, "channel send failed");
+        Self::ChanSend { channel, item }
+    }
+}
+
 pub struct Config {
     poll_max_msgs_size: usize,
     request_timeout: Duration,
-    gossip_diff_interval: Duration,
-    gossip_digest_interval: Duration,
+    transport_retry: RetryPolicy,
+    cas_retry: RetryPolicy,
+    replication_delta_interval: Duration,
+    replication_digest_interval: Duration,
 }
 
 impl Default for Config {
@@ -64,8 +73,18 @@ impl Default for Config {
         Config {
             poll_max_msgs_size: 100,
             request_timeout: Duration::from_millis(1000),
-            gossip_diff_interval: Duration::from_millis(1000),
-            gossip_digest_interval: Duration::from_millis(1000),
+            transport_retry: RetryPolicy {
+                max_times: 3,
+                min_delay: Duration::from_millis(25),
+                max_delay: Duration::from_millis(250),
+            },
+            cas_retry: RetryPolicy {
+                max_times: 8,
+                min_delay: Duration::from_millis(5),
+                max_delay: Duration::from_millis(100),
+            },
+            replication_delta_interval: Duration::from_millis(1000),
+            replication_digest_interval: Duration::from_millis(1000),
         }
     }
 }
@@ -84,20 +103,20 @@ where
     let (write_tx, write_rx) = mpsc::channel(32);
     let (client_tx, client_rx) = mpsc::channel(32);
     let (kv_tx, kv_rx) = mpsc::channel(32);
-    let (internode_tx, internode_rx) = mpsc::channel(32);
+    let (replication_tx, replication_rx) = mpsc::channel(32);
 
     let mut join_set = JoinSet::new();
     let token = CancellationToken::new();
-    let transport = Transport::new(write_tx, config.request_timeout);
+    let transport = Transport::new(write_tx, config.request_timeout, config.transport_retry);
     let logs = Logs::new();
-    let commited_offsets = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
-    let observed_offsets = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+    let commited_offsets = CommitedOffsets::new();
     let node_id: Arc<str> = node_id.into();
     let node_ids = Arc::new(node_ids);
+    let replication = Replication::new(logs.clone(), transport.clone(), node_ids.clone());
 
     join_set.spawn({
         let token = token.clone();
-        async move { receive_and_dispatch(token, client_tx, kv_tx, internode_tx, reader).await }
+        async move { receive_and_dispatch(token, client_tx, kv_tx, replication_tx, reader).await }
     });
 
     join_set.spawn({
@@ -113,15 +132,16 @@ where
         let commited_offsets = commited_offsets.clone();
 
         async move {
-            process_client_requests(
-                token,
-                client_rx,
+            App::new(
                 logs,
                 transport,
                 commited_offsets,
                 config.poll_max_msgs_size,
+                config.cas_retry,
             )
+            .run(token, client_rx)
             .await
+            .map_err(HandleErr::from)
         }
     });
 
@@ -134,48 +154,37 @@ where
 
     join_set.spawn({
         let token = token.clone();
-        let logs = logs.clone();
-        let observed_offsets = observed_offsets.clone();
+        let replication = replication.clone();
 
-        async move { process_internode(token, internode_rx, logs, observed_offsets).await }
-    });
-
-    join_set.spawn({
-        let transport = transport.clone();
-        let observed_offsets = observed_offsets.clone();
-        let logs = logs.clone();
-        let node_ids = node_ids.clone();
-        let token = token.clone();
         async move {
-            gossip_diff(
-                token,
-                config.gossip_diff_interval,
-                observed_offsets,
-                logs,
-                transport,
-                node_ids,
-            )
-            .await
+            replication
+                .run_inbound(token, replication_rx)
+                .await
+                .map_err(HandleErr::from)
         }
     });
 
     join_set.spawn({
-        let transport = transport.clone();
-        let logs = logs.clone();
-        let node_ids = node_ids.clone();
+        let replication = replication.clone();
+        let token = token.clone();
+        async move {
+            replication
+                .run_delta_sender(token, config.replication_delta_interval)
+                .await
+                .map_err(HandleErr::from)
+        }
+    });
+
+    join_set.spawn({
+        let replication = replication.clone();
         let token = token.clone();
         let node_id = node_id.clone();
 
         async move {
-            gossip_digest(
-                token,
-                config.gossip_digest_interval,
-                logs,
-                transport,
-                node_ids,
-                node_id,
-            )
-            .await
+            replication
+                .run_digest_announcer(token, config.replication_digest_interval, node_id)
+                .await
+                .map_err(HandleErr::from)
         }
     });
 
@@ -205,7 +214,7 @@ async fn receive_and_dispatch(
     token: CancellationToken,
     client_tx: mpsc::Sender<ClientRequest>,
     kv_tx: mpsc::Sender<KvEvent>,
-    internode_tx: mpsc::Sender<InterNodeReq>,
+    replication_tx: mpsc::Sender<ReplicationRequest>,
     mut reader: impl MessageReader,
 ) -> Result<(), HandleErr> {
     loop {
@@ -220,15 +229,16 @@ async fn receive_and_dispatch(
                     Incoming::ClientRequest(client_request) => client_tx
                         .send(client_request)
                         .await
-                        .map_err(|_| HandleErr::ChanSend("client_tx"))?,
+                        .map_err(|_| HandleErr::chan_send("client_tx", "client request"))?,
                     Incoming::KvEvent(kv_event) => kv_tx
                         .send(kv_event)
                         .await
-                        .map_err(|_| HandleErr::ChanSend("kv_event"))?,
-                    Incoming::NodeRequest(node_req) => internode_tx
-                        .send(node_req)
-                        .await
-                        .map_err(|_| HandleErr::ChanSend("node_req"))?,
+                        .map_err(|_| HandleErr::chan_send("kv_tx", "kv event"))?,
+                    Incoming::ReplicationRequest(replication_req) => {
+                        replication_tx.send(replication_req).await.map_err(|_| {
+                            HandleErr::chan_send("replication_tx", "replication request")
+                        })?
+                    }
                 },
                 Err(reason) => match reason {
                     DropReason::NoMsgId => Err(HandleErr::Msg(MsgErr::MissingField("msg_id")))?,
@@ -237,41 +247,6 @@ async fn receive_and_dispatch(
                     }
                     DropReason::Ignored => (),
                 },
-            },
-            None => return Ok(()),
-        }
-    }
-}
-
-async fn process_client_requests(
-    token: CancellationToken,
-    mut client_rx: mpsc::Receiver<ClientRequest>,
-    logs: Logs,
-    transport: Transport,
-    commited_offsets: Arc<tokio::sync::RwLock<HashMap<String, usize>>>,
-    poll_max_msgs_size: usize,
-) -> Result<(), HandleErr> {
-    loop {
-        let req = tokio::select! {
-            _ = token.cancelled() => return Ok(()),
-            req = client_rx.recv() => req,
-        };
-
-        match req {
-            Some(req) => match req {
-                ClientRequest::Send(req) => {
-                    handle_send(logs.clone(), req, transport.clone()).await?
-                }
-                ClientRequest::Poll(req) => {
-                    handle_poll(logs.clone(), req, transport.clone(), poll_max_msgs_size).await?
-                }
-                ClientRequest::CommitOffsets(req) => {
-                    handle_commit_offsets(commited_offsets.clone(), transport.clone(), req).await?
-                }
-                ClientRequest::ListCommittedOffsets(req) => {
-                    handle_list_commited_offsets(commited_offsets.clone(), transport.clone(), req)
-                        .await?
-                }
             },
             None => return Ok(()),
         }
@@ -311,210 +286,6 @@ async fn write(
         match msg {
             Some(msg) => writer.send(msg.into_msg(&node_id)).await?,
             None => return Ok(()),
-        }
-    }
-}
-
-async fn handle_poll(
-    logs: Logs,
-    req: PollReq,
-    transport: Transport,
-    limit: usize,
-) -> Result<(), TransportErr> {
-    let resp = ClientResponse::PollOk(PollOkRes {
-        msgs: logs.poll(req.offsets, limit).await,
-    });
-    transport
-        .send_client_response(resp, req.msg_id, req.src)
-        .await
-}
-
-async fn handle_list_commited_offsets(
-    commited_offsets: Arc<tokio::sync::RwLock<HashMap<String, usize>>>,
-    transport: Transport,
-    req: ListReq,
-) -> Result<(), TransportErr> {
-    let resp = ClientResponse::ListCommittedOffsetsOk(ListCommittedOffsetsOkRes {
-        offsets: commited_offsets.read().await.clone(),
-    });
-    transport
-        .send_client_response(resp, req.msg_id, req.src)
-        .await
-}
-
-async fn handle_send(logs: Logs, req: SendReq, transport: Transport) -> Result<(), HandleErr> {
-    let key = req.key;
-    let next_offset = logs.next_offset(&key).await;
-
-    let cas_req = CasReq {
-        key: key.clone(),
-        from: next_offset,
-        to: next_offset + 1,
-    };
-
-    let offset = rpc_cas(cas_req, transport.clone()).await?;
-
-    logs.append(key, req.msg, offset).await?;
-
-    let res = ClientResponse::SendOk(SendOkRes { offset });
-
-    transport
-        .send_client_response(res, req.msg_id, req.src)
-        .await?;
-    Ok(())
-}
-
-async fn handle_commit_offsets(
-    commited_offsets: Arc<tokio::sync::RwLock<HashMap<String, usize>>>,
-    transport: Transport,
-    req: CommitReq,
-) -> Result<(), TransportErr> {
-    let mut com_off = commited_offsets.write().await;
-
-    req.offsets.iter().for_each(|(key, noff)| {
-        com_off
-            .entry(key.clone())
-            .and_modify(|off| *off = *noff)
-            .or_insert(*noff);
-    });
-
-    transport
-        .send_client_response(ClientResponse::CommitOffsetsOk, req.msg_id, req.src)
-        .await
-}
-
-async fn rpc_cas(mut cas_req: CasReq, transport: Transport) -> Result<usize, HandleErr> {
-    loop {
-        let offset = cas_req.from;
-        let key = cas_req.key.clone();
-        let cas_res = transport.rpc_cas(&cas_req).await?;
-
-        match cas_res {
-            message::CasRes::Ok(_) => return Ok(offset),
-            message::CasRes::Retry(_) => {
-                let latest_offset = transport.rpc_read(&ReadReq { key }).await?;
-
-                cas_req.from = latest_offset;
-                cas_req.to = latest_offset + 1;
-
-                continue;
-            }
-            message::CasRes::Unknown(CasResUnknown { code, text, .. }) => {
-                return Err(HandleErr::UnexpectedCas { code, text });
-            }
-        }
-    }
-}
-
-async fn process_internode(
-    token: CancellationToken,
-    mut internode_rx: mpsc::Receiver<InterNodeReq>,
-    mut logs: Logs,
-    observed_offsets: Arc<tokio::sync::RwLock<HashMap<String, HashMap<String, usize>>>>,
-) -> Result<(), HandleErr> {
-    loop {
-        let req = tokio::select! {
-            _ = token.cancelled() => return Ok(()),
-            req = internode_rx.recv() => req,
-        };
-
-        match req {
-            Some(req) => handle_internode_req(req, &mut logs, &observed_offsets).await?,
-            None => return Ok(()),
-        }
-    }
-}
-
-async fn handle_internode_req(
-    req: InterNodeReq,
-    logs: &mut Logs,
-    observed_offsets: &Arc<tokio::sync::RwLock<HashMap<String, HashMap<String, usize>>>>,
-) -> Result<(), HandleErr> {
-    match req {
-        InterNodeReq::GossipDigest(digest_req) => {
-            handle_digest(observed_offsets.clone(), digest_req).await
-        }
-        InterNodeReq::GossipDiff(diff_req) => handle_diff(logs, diff_req).await,
-    }
-}
-
-async fn handle_digest(
-    observed_offsets: Arc<tokio::sync::RwLock<HashMap<String, HashMap<String, usize>>>>,
-    req: GossipDigestReq,
-) -> Result<(), HandleErr> {
-    let GossipDigestReq {
-        src,
-        digest: offsets,
-    } = req;
-
-    match observed_offsets.write().await.entry(src) {
-        Entry::Occupied(mut e) => *e.get_mut() = offsets,
-        Entry::Vacant(e) => {
-            let _ = e.insert(offsets);
-        }
-    }
-    Ok(())
-}
-
-async fn handle_diff(logs: &mut Logs, req: GossipDiffReq) -> Result<(), HandleErr> {
-    logs.merge(req.msgs).await.map_err(HandleErr::Storage)
-}
-
-async fn gossip_diff(
-    token: CancellationToken,
-    interval: Duration,
-    observed_offsets: Arc<tokio::sync::RwLock<HashMap<String, HashMap<String, usize>>>>,
-    logs: Logs,
-    transport: Transport,
-    node_ids: Arc<Vec<String>>,
-) -> Result<(), HandleErr> {
-    let mut interval = tokio::time::interval(interval);
-    loop {
-        tokio::select! {
-            _ = token.cancelled() => return Ok(()),
-            _ = interval.tick() => {},
-        }
-
-        let observed_offsets = observed_offsets.read().await;
-        for dest in node_ids.iter() {
-            let Some(observed_offset) = observed_offsets.get(dest) else {
-                continue;
-            };
-
-            let diff = logs.diff(observed_offset.clone()).await;
-            let req = InterNodeReq::GossipDiff(GossipDiffReq { msgs: diff });
-            transport
-                .send_internode_req(dest, req)
-                .await
-                .map_err(HandleErr::Transport)?;
-        }
-    }
-}
-
-async fn gossip_digest(
-    token: CancellationToken,
-    interval: Duration,
-    logs: Logs,
-    transport: Transport,
-    node_ids: Arc<Vec<String>>,
-    src: Arc<str>,
-) -> Result<(), HandleErr> {
-    let mut interval = tokio::time::interval(interval);
-    loop {
-        tokio::select! {
-            _ = token.cancelled() => return Ok(()),
-            _ = interval.tick() => {},
-        }
-
-        for dest in node_ids.iter() {
-            let req = InterNodeReq::GossipDigest(GossipDigestReq {
-                digest: logs.digest().await,
-                src: src.to_string(),
-            });
-            transport
-                .send_internode_req(dest, req)
-                .await
-                .map_err(HandleErr::Transport)?;
         }
     }
 }
