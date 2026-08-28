@@ -3,7 +3,7 @@ use thiserror::Error;
 
 use crate::{
     io::{IoError, MessageReader, MessageWriter},
-    protocol::maelstrom::{Body, Msg},
+    maelstrom::protocol::wire::{Body, Msg},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

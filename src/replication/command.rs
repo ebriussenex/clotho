@@ -1,15 +1,17 @@
 use std::collections::HashMap;
 
-pub enum ReplicationRequest {
+use crate::domain::{LogId, Offset};
+
+pub enum ReplicationCommand {
     PeerLogDigest(PeerLogDigest),
     LogDelta(LogDelta),
 }
 
 pub struct PeerLogDigest {
     pub peer_id: String,
-    pub offsets: HashMap<String, usize>,
+    pub offsets: HashMap<LogId, Offset>,
 }
 
 pub struct LogDelta {
-    pub msgs: HashMap<String, Vec<(usize, Vec<u32>)>>,
+    pub msgs: HashMap<LogId, Vec<(Offset, Vec<u32>)>>,
 }

@@ -1,19 +1,19 @@
+use crate::maelstrom::protocol::wire::Envelope;
 use crate::{
-    app::{ClientRequest, PollCommand, Request, SendCommand},
+    app::{
+        AppCommand, Command, CommitOffsetsCommand, ListCommittedOffsetsCommand, PollCommand,
+        ReplyContext, SendCommand,
+    },
     domain::{LogId, Offset},
     kv::{CasOkRes, CasRes, CasResUnknown, CasRetryRes, KvEvent, ReadRes},
-    offsets::command::{CommitOffsetsCommand, ListCommittedOffsetsCommand},
-    protocol::{
-        envelope::{Envelope, RequestContext},
-        maelstrom::{Msg, Payload},
-    },
-    replication::{LogDelta, PeerLogDigest, ReplicationRequest},
+    maelstrom::protocol::wire::{Msg, Payload},
+    replication::{LogDelta, PeerLogDigest, ReplicationCommand},
 };
 
 pub enum Incoming {
-    ClientRequest(ClientRequest),
+    AppCommand(AppCommand),
     KvEvent(KvEvent),
-    ReplicationRequest(ReplicationRequest),
+    ReplicationCommand(ReplicationCommand),
 }
 
 pub enum DropReason {
@@ -27,43 +27,47 @@ impl Msg<Payload> {
         let envelope = self.envelope();
         match self.body.payload {
             Payload::Send { key, msg } => {
-                let ctx = request_context(envelope)?;
-                Ok(Incoming::ClientRequest(ClientRequest::Send(Request {
-                    ctx,
-                    command: SendCommand { key, msg },
-                })))
+                let ctx = reply_context(envelope)?;
+                Ok(Incoming::AppCommand(AppCommand {
+                    reply_ctx: ctx,
+                    kind: Command::Send(SendCommand {
+                        key: LogId(key),
+                        msg,
+                    }),
+                }))
             }
             Payload::Poll { offsets } => {
-                let ctx = request_context(envelope)?;
-                Ok(Incoming::ClientRequest(ClientRequest::Poll(Request {
-                    ctx,
-                    command: PollCommand { offsets },
-                })))
+                let ctx = reply_context(envelope)?;
+                Ok(Incoming::AppCommand(AppCommand {
+                    reply_ctx: ctx,
+                    kind: Command::Poll(PollCommand {
+                        offsets: offsets
+                            .into_iter()
+                            .map(|(key, offset)| (LogId(key), Offset(offset as u64)))
+                            .collect(),
+                    }),
+                }))
             }
             Payload::CommitOffsets { offsets } => {
-                let ctx = request_context(envelope)?;
-                Ok(Incoming::ClientRequest(ClientRequest::CommitOffsets(
-                    Request {
-                        ctx,
-                        command: CommitOffsetsCommand {
-                            offsets: offsets
-                                .into_iter()
-                                .map(|(key, offset)| (LogId(key), Offset(offset as u64)))
-                                .collect(),
-                        },
-                    },
-                )))
+                let ctx = reply_context(envelope)?;
+                Ok(Incoming::AppCommand(AppCommand {
+                    reply_ctx: ctx,
+                    kind: Command::CommitOffsets(CommitOffsetsCommand {
+                        offsets: offsets
+                            .into_iter()
+                            .map(|(key, offset)| (LogId(key), Offset(offset as u64)))
+                            .collect(),
+                    }),
+                }))
             }
             Payload::ListCommittedOffsets { keys } => {
-                let ctx = request_context(envelope)?;
-                Ok(Incoming::ClientRequest(
-                    ClientRequest::ListCommittedOffsets(Request {
-                        ctx,
-                        command: ListCommittedOffsetsCommand {
-                            keys: keys.into_iter().map(LogId).collect(),
-                        },
+                let ctx = reply_context(envelope)?;
+                Ok(Incoming::AppCommand(AppCommand {
+                    reply_ctx: ctx,
+                    kind: Command::ListCommittedOffsets(ListCommittedOffsetsCommand {
+                        keys: keys.into_iter().map(LogId).collect(),
                     }),
-                ))
+                }))
             }
             Payload::CasOk => {
                 let in_reply_to = self.body.in_reply_to.ok_or(DropReason::NoInReplyTo)?;
@@ -75,7 +79,7 @@ impl Msg<Payload> {
                 let in_reply_to = self.body.in_reply_to.ok_or(DropReason::NoInReplyTo)?;
                 Ok(Incoming::KvEvent(KvEvent::ReadRes(ReadRes {
                     in_reply_to,
-                    value,
+                    value: Offset(value as u64),
                 })))
             }
             Payload::Error { code, text } => {
@@ -94,15 +98,31 @@ impl Msg<Payload> {
             }
             Payload::GossipDigest { digest } => {
                 let src = self.src;
-                Ok(Incoming::ReplicationRequest(
-                    ReplicationRequest::PeerLogDigest(PeerLogDigest {
+                Ok(Incoming::ReplicationCommand(
+                    ReplicationCommand::PeerLogDigest(PeerLogDigest {
                         peer_id: src,
-                        offsets: digest,
+                        offsets: digest
+                            .into_iter()
+                            .map(|(key, offset)| (LogId(key), Offset(offset as u64)))
+                            .collect(),
                     }),
                 ))
             }
-            Payload::GossipDiff { msgs } => Ok(Incoming::ReplicationRequest(
-                ReplicationRequest::LogDelta(LogDelta { msgs }),
+            Payload::GossipDiff { msgs } => Ok(Incoming::ReplicationCommand(
+                ReplicationCommand::LogDelta(LogDelta {
+                    msgs: msgs
+                        .into_iter()
+                        .map(|(key, chunks)| {
+                            (
+                                LogId(key),
+                                chunks
+                                    .into_iter()
+                                    .map(|(offset, msgs)| (Offset(offset as u64), msgs))
+                                    .collect(),
+                            )
+                        })
+                        .collect(),
+                }),
             )),
             Payload::SendOk { .. }
             | Payload::PollOk { .. }
@@ -114,11 +134,11 @@ impl Msg<Payload> {
     }
 }
 
-fn request_context(envelope: Envelope) -> Result<RequestContext, DropReason> {
+fn reply_context(envelope: Envelope) -> Result<ReplyContext, DropReason> {
     let in_reply_to = envelope.msg_id.ok_or(DropReason::NoMsgId)?;
 
-    Ok(RequestContext {
-        reply_to: envelope.src,
+    Ok(ReplyContext {
+        dest: envelope.src,
         in_reply_to,
     })
 }

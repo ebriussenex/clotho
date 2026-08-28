@@ -1,13 +1,13 @@
 use crate::{
     app::{ClientResponse, ListCommittedOffsetsRes, PollRes, SendRes},
     kv::{CasReq, KvRequest, ReadReq},
-    protocol::maelstrom::{Body, Msg, Payload},
-    replication::{LogDelta, PeerLogDigest, ReplicationRequest},
+    maelstrom::protocol::wire::{Body, Msg, Payload},
+    replication::{LogDelta, ReplicationMessage},
 };
 
 pub enum Outgoing {
     KvRequest {
-        req: KvRequest,
+        request: KvRequest,
         msg_id: usize,
     },
     ClientResponse {
@@ -16,24 +16,24 @@ pub enum Outgoing {
         in_reply_to: usize,
         dest: String,
     },
-    ReplicationRequest {
-        req: ReplicationRequest,
+    Replication {
+        message: ReplicationMessage,
         msg_id: usize,
         dest: String,
     },
 }
 
 impl From<KvRequest> for Payload {
-    fn from(req: KvRequest) -> Self {
-        match req {
+    fn from(request: KvRequest) -> Self {
+        match request {
             KvRequest::Cas(CasReq { key, from, to, .. }) => Payload::Cas {
-                key,
-                from,
-                to,
+                key: key.0,
+                from: from.0 as usize,
+                to: to.0 as usize,
                 create_if_not_exists: true,
             },
 
-            KvRequest::Read(ReadReq { key, .. }) => Payload::Read { key },
+            KvRequest::Read(ReadReq { key, .. }) => Payload::Read { key: key.0 },
         }
     }
 }
@@ -41,23 +41,58 @@ impl From<KvRequest> for Payload {
 impl From<ClientResponse> for Payload {
     fn from(res: ClientResponse) -> Self {
         match res {
-            ClientResponse::Send(SendRes { offset }) => Payload::SendOk { offset },
-            ClientResponse::Poll(PollRes { msgs }) => Payload::PollOk { msgs },
+            ClientResponse::Send(SendRes { offset }) => Payload::SendOk {
+                offset: offset.0 as usize,
+            },
+            ClientResponse::Poll(PollRes { msgs }) => Payload::PollOk {
+                msgs: msgs
+                    .into_iter()
+                    .map(|(key, msgs)| {
+                        (
+                            key.0,
+                            msgs.into_iter()
+                                .map(|(offset, msg)| (offset.0 as usize, msg))
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            },
             ClientResponse::CommitOffsets => Payload::CommitOffsetsOk,
             ClientResponse::ListCommittedOffsets(ListCommittedOffsetsRes { offsets }) => {
-                Payload::ListCommittedOffsetsOk { offsets }
+                Payload::ListCommittedOffsetsOk {
+                    offsets: offsets
+                        .into_iter()
+                        .map(|(key, offset)| (key.0, offset.0 as usize))
+                        .collect(),
+                }
             }
         }
     }
 }
 
-impl From<ReplicationRequest> for Payload {
-    fn from(req: ReplicationRequest) -> Self {
-        match req {
-            ReplicationRequest::PeerLogDigest(PeerLogDigest { offsets, .. }) => {
-                Payload::GossipDigest { digest: offsets }
-            }
-            ReplicationRequest::LogDelta(LogDelta { msgs }) => Payload::GossipDiff { msgs },
+impl From<ReplicationMessage> for Payload {
+    fn from(message: ReplicationMessage) -> Self {
+        match message {
+            ReplicationMessage::LogDigest(offsets) => Payload::GossipDigest {
+                digest: offsets
+                    .into_iter()
+                    .map(|(key, offset)| (key.0, offset.0 as usize))
+                    .collect(),
+            },
+            ReplicationMessage::LogDelta(LogDelta { msgs }) => Payload::GossipDiff {
+                msgs: msgs
+                    .into_iter()
+                    .map(|(key, chunks)| {
+                        (
+                            key.0,
+                            chunks
+                                .into_iter()
+                                .map(|(offset, msgs)| (offset.0 as usize, msgs))
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            },
         }
     }
 }
@@ -65,13 +100,13 @@ impl From<ReplicationRequest> for Payload {
 impl Outgoing {
     pub fn into_msg(self, node_id: &str) -> Msg<Payload> {
         match self {
-            Outgoing::KvRequest { req, msg_id } => Msg {
+            Outgoing::KvRequest { request, msg_id } => Msg {
                 src: node_id.to_string(),
                 dest: "lin-kv".to_string(),
                 body: Body {
                     id: Some(msg_id),
                     in_reply_to: None,
-                    payload: req.into(),
+                    payload: request.into(),
                 },
             },
             Outgoing::ClientResponse {
@@ -88,12 +123,16 @@ impl Outgoing {
                     payload: res.into(),
                 },
             },
-            Outgoing::ReplicationRequest { req, dest, msg_id } => Msg {
+            Outgoing::Replication {
+                message,
+                dest,
+                msg_id,
+            } => Msg {
                 src: node_id.to_string(),
                 dest,
                 body: Body {
                     id: Some(msg_id),
-                    payload: req.into(),
+                    payload: message.into(),
                     in_reply_to: None,
                 },
             },

@@ -6,13 +6,11 @@ mod app;
 mod domain;
 mod io;
 mod kv;
+mod logs;
+mod maelstrom;
 mod message;
 mod node;
-mod offsets;
-mod protocol;
 mod replication;
-mod retry;
-mod storage;
 mod transport;
 
 fn init_tracing() {
@@ -33,7 +31,7 @@ async fn main() {
     let config = Config::default();
 
     let (node_id, node_ids) =
-        match protocol::init::handshake(&mut msg_reader, &mut msg_writer).await {
+        match maelstrom::protocol::init::handshake(&mut msg_reader, &mut msg_writer).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!(error = %e, "handshake failed");

@@ -6,14 +6,14 @@ pub enum KvRequest {
 
 #[derive(Clone)]
 pub struct CasReq {
-    pub key: String,
-    pub from: usize,
-    pub to: usize,
+    pub key: LogId,
+    pub from: Offset,
+    pub to: Offset,
 }
 
 #[derive(Clone)]
 pub struct ReadReq {
-    pub key: String,
+    pub key: LogId,
 }
 
 pub enum KvEvent {
@@ -36,7 +36,7 @@ pub struct CasRetryRes {
 }
 
 pub struct ReadRes {
-    pub value: usize,
+    pub value: Offset,
     pub in_reply_to: usize,
 }
 
@@ -59,3 +59,4 @@ impl KvEvent {
         }
     }
 }
+use crate::domain::{LogId, Offset};

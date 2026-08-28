@@ -1,7 +1,9 @@
 use std::{collections::HashMap, sync::Arc};
 
-use crate::domain::{LogId, Offset};
-use crate::offsets::command::{CommitOffsetsCommand, ListCommittedOffsetsCommand};
+use crate::{
+    app::{CommitOffsetsCommand, ListCommittedOffsetsCommand},
+    domain::{LogId, Offset},
+};
 
 #[derive(Clone)]
 pub struct CommitedOffsets {

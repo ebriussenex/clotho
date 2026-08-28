@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use crate::domain::{LogId, Offset};
+
 pub enum ClientResponse {
     Send(SendRes),
     Poll(PollRes),
@@ -8,13 +10,13 @@ pub enum ClientResponse {
 }
 
 pub struct SendRes {
-    pub offset: usize,
+    pub offset: Offset,
 }
 
 pub struct PollRes {
-    pub msgs: HashMap<String, Vec<(usize, u32)>>,
+    pub msgs: HashMap<LogId, Vec<(Offset, u32)>>,
 }
 
 pub struct ListCommittedOffsetsRes {
-    pub offsets: HashMap<String, usize>,
+    pub offsets: HashMap<LogId, Offset>,
 }

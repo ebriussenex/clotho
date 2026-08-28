@@ -2,7 +2,11 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::envelope::Envelope;
+#[derive(Debug, Clone)]
+pub struct Envelope {
+    pub src: String,
+    pub msg_id: Option<usize>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Msg<Payload> {

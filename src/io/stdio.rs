@@ -2,10 +2,8 @@ use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines, Stdin};
 
-use crate::{
-    io::{IoError, MessageReader, MessageWriter},
-    protocol::maelstrom::Msg,
-};
+use crate::io::{IoError, MessageReader, MessageWriter};
+use crate::maelstrom::protocol::wire::Msg;
 
 #[derive(Debug, Error)]
 pub enum StdioErr {

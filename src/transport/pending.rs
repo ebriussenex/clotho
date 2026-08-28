@@ -35,7 +35,7 @@ impl PendingTable {
         if let Entry::Occupied(entry) = cast.entry(msg_id) {
             let tx = entry.remove();
             tx.send(res)
-                .map_err(|_| TransportErr::chan_send("cas_tx", "cas response"))?;
+                .map_err(|_| TransportErr::chan_send::<CasRes>("cas_tx"))?;
         } else {
             return Err(TransportErr::NotAwaited);
         }
@@ -59,7 +59,7 @@ impl PendingTable {
         if let Entry::Occupied(entry) = kv_read_m.entry(msg_id) {
             let tx = entry.remove();
             tx.send(res)
-                .map_err(|_| TransportErr::chan_send("read_tx", "read response"))?;
+                .map_err(|_| TransportErr::chan_send::<ReadRes>("read_tx"))?;
         } else {
             return Err(TransportErr::NotAwaited);
         }
