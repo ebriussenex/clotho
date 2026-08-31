@@ -3,71 +3,49 @@ use std::{
     sync::Arc,
 };
 
-use tokio::sync::oneshot;
+use tokio::sync::{Mutex, oneshot};
 
-use crate::kv::{CasRes, ReadRes};
+use crate::app::CommandResponse;
 
 use super::TransportErr;
 
+type PendingReplies = HashMap<usize, oneshot::Sender<CommandResponse>>;
+
 #[derive(Clone)]
 pub struct PendingTable {
-    cas: Arc<tokio::sync::Mutex<HashMap<usize, oneshot::Sender<CasRes>>>>,
-    kv_read: Arc<tokio::sync::Mutex<HashMap<usize, oneshot::Sender<ReadRes>>>>,
+    replies: Arc<Mutex<PendingReplies>>,
 }
 
 impl PendingTable {
     pub fn new() -> Self {
-        PendingTable {
-            cas: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            kv_read: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        Self {
+            replies: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    pub async fn add_cas(&self, msg_id: usize) -> oneshot::Receiver<CasRes> {
+    pub async fn add(&self, msg_id: usize) -> oneshot::Receiver<CommandResponse> {
         let (tx, rx) = oneshot::channel();
-        self.cas.lock().await.insert(msg_id, tx);
+        self.replies.lock().await.insert(msg_id, tx);
         rx
     }
 
-    pub async fn reg_cas(&self, msg_id: usize, res: CasRes) -> Result<(), TransportErr> {
-        let mut cast = self.cas.lock().await;
-
-        if let Entry::Occupied(entry) = cast.entry(msg_id) {
-            let tx = entry.remove();
-            tx.send(res)
-                .map_err(|_| TransportErr::chan_send::<CasRes>("cas_tx"))?;
-        } else {
+    pub async fn register(
+        &self,
+        msg_id: usize,
+        response: CommandResponse,
+    ) -> Result<(), TransportErr> {
+        let mut replies = self.replies.lock().await;
+        let Entry::Occupied(entry) = replies.entry(msg_id) else {
             return Err(TransportErr::NotAwaited);
-        }
+        };
 
-        Ok(())
+        entry
+            .remove()
+            .send(response)
+            .map_err(|_| TransportErr::chan_send::<CommandResponse>("command_reply_tx"))
     }
 
-    pub async fn remove_cas(&self, msg_id: usize) {
-        self.cas.lock().await.remove(&msg_id);
-    }
-
-    pub async fn add_read(&self, msg_id: usize) -> oneshot::Receiver<ReadRes> {
-        let (tx, rx) = oneshot::channel();
-        self.kv_read.lock().await.insert(msg_id, tx);
-        rx
-    }
-
-    pub async fn reg_read(&self, msg_id: usize, res: ReadRes) -> Result<(), TransportErr> {
-        let mut kv_read_m = self.kv_read.lock().await;
-
-        if let Entry::Occupied(entry) = kv_read_m.entry(msg_id) {
-            let tx = entry.remove();
-            tx.send(res)
-                .map_err(|_| TransportErr::chan_send::<ReadRes>("read_tx"))?;
-        } else {
-            return Err(TransportErr::NotAwaited);
-        }
-
-        Ok(())
-    }
-
-    pub async fn remove_read(&self, msg_id: usize) {
-        self.kv_read.lock().await.remove(&msg_id);
+    pub async fn remove(&self, msg_id: usize) {
+        self.replies.lock().await.remove(&msg_id);
     }
 }

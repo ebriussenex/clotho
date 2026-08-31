@@ -1,18 +1,18 @@
 use crate::maelstrom::protocol::wire::Envelope;
 use crate::{
     app::{
-        AppCommand, Command, CommitOffsetsCommand, ListCommittedOffsetsCommand, PollCommand,
-        ReplyContext, SendCommand,
+        AppCommand, Command, CommandReply, CommandResponse, CommitOffsetsCommand,
+        ListCommittedOffsetsCommand, ListCommittedOffsetsRes, PollCommand, PollRes, ReplyContext,
+        SendCommand, SendRes,
     },
     domain::{LogId, Offset},
-    kv::{CasOkRes, CasRes, CasResUnknown, CasRetryRes, KvEvent, ReadRes},
     maelstrom::protocol::wire::{Msg, Payload},
     replication::{LogDelta, PeerLogDigest, ReplicationCommand},
 };
 
 pub enum Incoming {
     AppCommand(AppCommand),
-    KvEvent(KvEvent),
+    CommandReply(CommandReply),
     ReplicationCommand(ReplicationCommand),
 }
 
@@ -69,33 +69,38 @@ impl Msg<Payload> {
                     }),
                 }))
             }
-            Payload::CasOk => {
-                let in_reply_to = self.body.in_reply_to.ok_or(DropReason::NoInReplyTo)?;
-                Ok(Incoming::KvEvent(KvEvent::CasRes(CasRes::Ok(CasOkRes {
-                    in_reply_to,
-                }))))
-            }
-            Payload::ReadOk { value } => {
-                let in_reply_to = self.body.in_reply_to.ok_or(DropReason::NoInReplyTo)?;
-                Ok(Incoming::KvEvent(KvEvent::ReadRes(ReadRes {
-                    in_reply_to,
-                    value: Offset(value as u64),
-                })))
-            }
-            Payload::Error { code, text } => {
-                let in_reply_to = self.body.in_reply_to.ok_or(DropReason::NoInReplyTo)?;
-
-                let event = match code {
-                    22 => CasRes::Retry(CasRetryRes { in_reply_to }),
-                    _ => CasRes::Unknown(CasResUnknown {
-                        code,
-                        text,
-                        in_reply_to,
-                    }),
-                };
-
-                Ok(Incoming::KvEvent(KvEvent::CasRes(event)))
-            }
+            Payload::SendOk { offset } => command_reply(
+                envelope,
+                CommandResponse::Send(SendRes {
+                    offset: Offset(offset as u64),
+                }),
+            ),
+            Payload::PollOk { msgs } => command_reply(
+                envelope,
+                CommandResponse::Poll(PollRes {
+                    msgs: msgs
+                        .into_iter()
+                        .map(|(key, msgs)| {
+                            (
+                                LogId(key),
+                                msgs.into_iter()
+                                    .map(|(offset, msg)| (Offset(offset as u64), msg))
+                                    .collect(),
+                            )
+                        })
+                        .collect(),
+                }),
+            ),
+            Payload::CommitOffsetsOk => command_reply(envelope, CommandResponse::CommitOffsets),
+            Payload::ListCommittedOffsetsOk { offsets } => command_reply(
+                envelope,
+                CommandResponse::ListCommittedOffsets(ListCommittedOffsetsRes {
+                    offsets: offsets
+                        .into_iter()
+                        .map(|(key, offset)| (LogId(key), Offset(offset as u64)))
+                        .collect(),
+                }),
+            ),
             Payload::GossipDigest { digest } => {
                 let src = self.src;
                 Ok(Incoming::ReplicationCommand(
@@ -124,14 +129,17 @@ impl Msg<Payload> {
                         .collect(),
                 }),
             )),
-            Payload::SendOk { .. }
-            | Payload::PollOk { .. }
-            | Payload::CommitOffsetsOk
-            | Payload::ListCommittedOffsetsOk { .. }
-            | Payload::Cas { .. }
-            | Payload::Read { .. } => Err(DropReason::Ignored),
+            Payload::Error { .. } => Err(DropReason::Ignored),
         }
     }
+}
+
+fn command_reply(envelope: Envelope, response: CommandResponse) -> Result<Incoming, DropReason> {
+    Ok(Incoming::CommandReply(CommandReply {
+        src: envelope.src,
+        in_reply_to: envelope.in_reply_to.ok_or(DropReason::NoInReplyTo)?,
+        response,
+    }))
 }
 
 fn reply_context(envelope: Envelope) -> Result<ReplyContext, DropReason> {

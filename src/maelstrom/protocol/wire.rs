@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub struct Envelope {
     pub src: String,
     pub msg_id: Option<usize>,
+    pub in_reply_to: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,6 +21,7 @@ impl<Payload> Msg<Payload> {
         Envelope {
             src: self.src.clone(),
             msg_id: self.body.id,
+            in_reply_to: self.body.in_reply_to,
         }
     }
 }
@@ -60,19 +62,6 @@ pub enum Payload {
     ListCommittedOffsetsOk {
         offsets: HashMap<String, usize>,
     },
-    Cas {
-        key: String,
-        from: usize,
-        to: usize,
-        create_if_not_exists: bool,
-    },
-    Read {
-        key: String,
-    },
-    ReadOk {
-        value: usize,
-    },
-    CasOk,
     Error {
         code: u8,
         text: String,

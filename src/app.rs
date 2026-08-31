@@ -8,5 +8,5 @@ pub use command::{
     ReplyContext, SendCommand,
 };
 pub use offsets::CommitedOffsets;
-pub use response::{ClientResponse, ListCommittedOffsetsRes, PollRes, SendRes};
+pub use response::{CommandReply, CommandResponse, ListCommittedOffsetsRes, PollRes, SendRes};
 pub use service::{App, AppErr};

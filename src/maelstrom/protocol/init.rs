@@ -47,7 +47,7 @@ pub async fn handshake(
         InitPayload::InitOk => return Err(InitErr::NotInit),
     };
 
-    let node_ids = node_ids
+    let peers_ids = node_ids
         .into_iter()
         .filter(|n_id| **n_id != node_id)
         .collect();
@@ -63,5 +63,5 @@ pub async fn handshake(
     };
     writer.send(reply).await?;
 
-    Ok((node_id, node_ids))
+    Ok((node_id, peers_ids))
 }

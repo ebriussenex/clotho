@@ -5,7 +5,6 @@ use tokio::{self};
 mod app;
 mod domain;
 mod io;
-mod kv;
 mod logs;
 mod maelstrom;
 mod message;
@@ -30,7 +29,7 @@ async fn main() {
     let mut msg_writer = StdioWriter::default();
     let config = Config::default();
 
-    let (node_id, node_ids) =
+    let (node_id, peers_ids) =
         match maelstrom::protocol::init::handshake(&mut msg_reader, &mut msg_writer).await {
             Ok(v) => v,
             Err(e) => {
@@ -39,9 +38,17 @@ async fn main() {
             }
         };
 
-    tracing::info!(node_id = %node_id, peers = ?node_ids, "node initialized");
+    tracing::info!(node_id = %node_id, peers = ?peers_ids, "node initialized");
 
-    match node::run(config, node_id, node_ids, msg_reader, msg_writer).await {
+    match node::run(
+        config,
+        &node_id,
+        peers_ids.as_slice(),
+        msg_reader,
+        msg_writer,
+    )
+    .await
+    {
         Ok(_) => tracing::info!("node shutdown successfully"),
         Err(e) => {
             tracing::error!(error = %e, "node run failed");

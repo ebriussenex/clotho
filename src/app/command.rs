@@ -13,6 +13,7 @@ pub struct AppCommand {
     pub kind: Command,
 }
 
+#[derive(Debug)]
 pub enum Command {
     Send(SendCommand),
     Poll(PollCommand),
@@ -20,11 +21,13 @@ pub enum Command {
     ListCommittedOffsets(ListCommittedOffsetsCommand),
 }
 
+#[derive(Debug)]
 pub struct SendCommand {
     pub key: LogId,
     pub msg: u32,
 }
 
+#[derive(Debug)]
 pub struct PollCommand {
     pub offsets: HashMap<LogId, Offset>,
 }
