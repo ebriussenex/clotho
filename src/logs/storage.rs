@@ -58,7 +58,7 @@ pub struct StoreConfig {
 
 /// Logs storage. DashMap for sharding, actor for each topic
 struct Store {
-    partitions: DashMap<String, PartitionHandle>,
+    partitions: DashMap<String, Partition>,
     config: StoreConfig,
 }
 
@@ -76,15 +76,14 @@ impl Store {
     }
 
     fn get_or_create_handle(&self, topic: &str) -> PartitionHandle {
-        if let Some(handle) = self.partitions.get(topic) {
-            return handle.clone();
+        if let Some(partition) = self.partitions.get(topic) {
+            return partition.handle.clone();
         }
 
         self.partitions
             .entry(topic.to_string())
-            .or_insert_with(|| {
-                PartitionHandle::new(self.config.channel_buffer, self.config.segment_size)
-            })
+            .or_insert_with(|| Partition::new(self.config.channel_buffer, self.config.segment_size))
+            .handle
             .clone()
     }
 
@@ -96,15 +95,64 @@ impl Store {
         let mut result = HashMap::with_capacity(offsets.len());
 
         for (topic, &from_offset) in offsets {
-            let Some(handle) = self.partitions.get(topic).map(|handle| handle.clone()) else {
+            let Some(reader) = self
+                .partitions
+                .get(topic)
+                .map(|partition| partition.reader.clone())
+            else {
                 continue;
             };
 
-            if let Some(entries) = handle.read(from_offset, limit) {
+            if let Some(entries) = reader.read(from_offset, limit) {
                 result.insert(topic.clone(), (from_offset, entries));
             }
         }
         result
+    }
+}
+
+struct Partition {
+    handle: PartitionHandle,
+    reader: PartitionReader,
+}
+
+impl Partition {
+    fn new(channel_buffer: usize, segment_size: usize) -> Self {
+        Self {
+            handle: PartitionHandle::new(channel_buffer, segment_size),
+            reader: PartitionReader::default(),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct PartitionReader {
+    active: Arc<ArcSwap<ActiveSegment>>,
+    sealed: Arc<ArcSwap<SealedSegments>>,
+}
+
+impl PartitionReader {
+    fn read(&self, from: u64, limit: usize) -> Option<Vec<Bytes>> {
+        // order matters
+        let active = self.active.load_full();
+        let sealed = self.sealed.load_full();
+
+        let end = active.base_offset + active.entries.count() as u64;
+        let available = end.saturating_sub(from) as usize;
+        let take = available.min(limit);
+        if take == 0 {
+            return None;
+        }
+
+        let mut result = Vec::with_capacity(take);
+        sealed.read_into(from, active.base_offset, take, &mut result);
+
+        let next_offset = from + result.len() as u64;
+        if next_offset >= active.base_offset {
+            active.read_into(next_offset, take, &mut result);
+        }
+
+        Some(result)
     }
 }
 
@@ -204,8 +252,6 @@ impl PartitionActor {
 #[derive(Clone)]
 struct PartitionHandle {
     sender: mpsc::Sender<PartitionMsg>,
-    active: Arc<ArcSwap<ActiveSegment>>,
-    sealed: Arc<ArcSwap<SealedSegments>>,
 }
 
 impl PartitionHandle {
@@ -221,11 +267,7 @@ impl PartitionHandle {
             tokio::spawn(run_partition_actor(actor));
         }
 
-        Self {
-            sender,
-            active,
-            sealed,
-        }
+        Self { sender }
     }
 
     async fn append(&self, entry: Bytes) -> u64 {
@@ -238,29 +280,6 @@ impl PartitionHandle {
             .unwrap();
 
         reply.await.expect("fatal: partition actor broken!")
-    }
-
-    fn read(&self, from: u64, limit: usize) -> Option<Vec<Bytes>> {
-        // order matters
-        let active = self.active.load_full();
-        let sealed = self.sealed.load_full();
-
-        let end = active.base_offset + active.entries.count() as u64;
-        let available = end.saturating_sub(from) as usize;
-        let take = available.min(limit);
-        if take == 0 {
-            return None;
-        }
-
-        let mut result = Vec::with_capacity(take);
-        sealed.read_into(from, active.base_offset, take, &mut result);
-
-        let next_offset = from + result.len() as u64;
-        if next_offset >= active.base_offset {
-            active.read_into(next_offset, take, &mut result);
-        }
-
-        Some(result)
     }
 }
 
@@ -340,6 +359,8 @@ impl ActiveSegment {
         }
     }
 }
+
+// TODO: delte it all
 
 struct LogStore<T> {
     logs: HashMap<LogId, Vec<Option<T>>>,
