@@ -1,20 +1,13 @@
-use std::{collections::HashMap, fmt::Debug, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Duration};
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot},
-    time::Interval,
+    time::error::Elapsed,
 };
-use tokio_util::bytes::Bytes;
-
-use crate::domain::{LogId, Offset};
-
-#[derive(Debug)]
-pub enum Op {
-    Poll,
-}
+use tokio_util::{bytes::Bytes, sync::CancellationToken, task::TaskTracker};
 
 #[derive(Debug, Error)]
 pub enum StorageErr {
@@ -36,6 +29,10 @@ pub enum StorageErr {
     Actor(#[from] ActorErr),
     #[error("task panicked: {0}")]
     TaskPanicked(#[from] tokio::task::JoinError),
+    #[error("storage is shutting down")]
+    ShuttingDown,
+    #[error("internal error: partition actor died")]
+    InternalError,
 }
 
 #[derive(Debug, Error)]
@@ -53,24 +50,34 @@ pub enum ActorErr {
 pub struct StoreConfig {
     channel_buffer: usize,
     segment_size: usize,
-    force_flush_interval: Interval,
+    grace_duration: Duration,
 }
 
-/// Logs storage. DashMap for sharding, actor for each topic
+/// Logs storage. DashMap for sharding, actor for each topic. Topics created dynamically on append.
 struct Store {
     partitions: DashMap<String, Partition>,
     config: StoreConfig,
+    shutdown_token: CancellationToken,
+    tasks: TaskTracker,
 }
 
 impl Store {
-    fn new(config: StoreConfig) -> Self {
+    fn new(config: StoreConfig, shutdown_token: CancellationToken) -> Self {
         Self {
             partitions: DashMap::new(),
             config,
+            shutdown_token,
+            tasks: TaskTracker::new(),
         }
     }
 
-    pub async fn append(&self, topic: &str, entry: Bytes) -> u64 {
+    /// Appends new entry to topic. `StorageErr::ShuttingDown` means that Storage is shutting down
+    /// and no new append requests accepted.
+    pub async fn append(&self, topic: &str, entry: Bytes) -> Result<u64, StorageErr> {
+        if self.shutdown_token.is_cancelled() {
+            return Err(StorageErr::ShuttingDown);
+        }
+
         let handle = self.get_or_create_handle(topic);
         handle.append(entry).await
     }
@@ -82,11 +89,19 @@ impl Store {
 
         self.partitions
             .entry(topic.to_string())
-            .or_insert_with(|| Partition::new(self.config.channel_buffer, self.config.segment_size))
+            .or_insert_with(|| {
+                Partition::new(
+                    self.config.channel_buffer,
+                    self.config.segment_size,
+                    &self.tasks,
+                    self.shutdown_token.child_token(),
+                )
+            })
             .handle
             .clone()
     }
 
+    /// Polls every listed topic from specified offset with limit
     pub fn poll(
         &self,
         offsets: &HashMap<String, u64>,
@@ -109,17 +124,31 @@ impl Store {
         }
         result
     }
+
+    /// Shuts down storage gracefully, waiting for append operations to complete while preventing
+    /// new appends during shutdown
+    pub async fn shutdown(&self) -> Result<(), Elapsed> {
+        self.tasks.close();
+        tokio::time::timeout(self.config.grace_duration, self.tasks.wait()).await
+    }
 }
 
+/// Partition is a view to handle (of related `PartitionActor`) to append new entries and reader -
+/// to read existing entries from both active and sealed parts
 struct Partition {
     handle: PartitionHandle,
     reader: PartitionReader,
 }
 
 impl Partition {
-    fn new(channel_buffer: usize, segment_size: usize) -> Self {
+    fn new(
+        channel_buffer: usize,
+        segment_size: usize,
+        tasks: &TaskTracker,
+        shutdown_token: CancellationToken,
+    ) -> Self {
         Self {
-            handle: PartitionHandle::new(channel_buffer, segment_size),
+            handle: PartitionHandle::new(channel_buffer, segment_size, tasks, shutdown_token),
             reader: PartitionReader::default(),
         }
     }
@@ -165,6 +194,9 @@ enum PartitionMsg {
     },
 }
 
+/// Actor for log storage. The only place where logs are modified, with `PartitionHandle` owns state
+/// and makes decisions about sealing. Actor is per-topic object. Works for the same purpose for
+/// which write lock would have worked - makes writer single, appending logs sequentially.
 struct PartitionActor {
     receiver: mpsc::Receiver<PartitionMsg>,
     sealed: Arc<ArcSwap<SealedSegments>>,
@@ -172,23 +204,37 @@ struct PartitionActor {
 
     segment_size: usize,
     base_offset: usize,
+
+    shutdown_token: CancellationToken,
 }
 
-async fn run_partition_actor(mut actor: PartitionActor) {
-    while let Some(msg) = actor.receiver.recv().await {
-        actor.handle_msg(msg).await;
+async fn run_partition_actor(mut actor: PartitionActor) -> Result<(), StorageErr> {
+    loop {
+        tokio::select! {
+            biased;
+            _ = actor.shutdown_token.cancelled() => break,
+            msg = actor.receiver.recv() => match msg {
+                Some(msg) => actor.handle_msg(msg).await?,
+                None => return Ok(()),
+            },
+        }
     }
+
+    // gracefully write messages we got
+    actor.receiver.close();
+    while let Some(msg) = actor.receiver.recv().await {
+        actor.handle_msg(msg).await?;
+    }
+    Ok(())
 }
 
-/// Actor for log storage. The only place where logs are modified, with `PartitionHandle` owns state
-/// and makes decisions about sealing. Actor is per-topic object. Works for the same purpose for
-/// which write lock would have worked - makes writer single, appending logs sequentially.
 impl PartitionActor {
     fn new(
         receiver: mpsc::Receiver<PartitionMsg>,
         sealed: Arc<ArcSwap<SealedSegments>>,
         active: Arc<ArcSwap<ActiveSegment>>,
         segment_size: usize,
+        shutdown_token: CancellationToken,
     ) -> Self {
         Self {
             receiver,
@@ -196,19 +242,21 @@ impl PartitionActor {
             active,
             base_offset: 0,
             segment_size,
+            shutdown_token,
         }
     }
 
-    async fn handle_msg(&mut self, msg: PartitionMsg) {
+    async fn handle_msg(&mut self, msg: PartitionMsg) -> Result<(), StorageErr> {
         match msg {
             PartitionMsg::Append { entry, reply_to } => {
                 let offset = self.append(entry);
                 // write in log successfull, but we don't response and actor system fatally broken
                 reply_to
                     .send(offset)
-                    .expect("fatal: partition actor broken")
+                    .map_err(|_| StorageErr::InternalError)?;
             }
         }
+        Ok(())
     }
 
     fn append(&mut self, entry: Bytes) -> u64 {
@@ -255,7 +303,12 @@ struct PartitionHandle {
 }
 
 impl PartitionHandle {
-    pub fn new(channel_buffer: usize, segment_size: usize) -> Self {
+    pub fn new(
+        channel_buffer: usize,
+        segment_size: usize,
+        tasks: &TaskTracker,
+        shutdown_token: CancellationToken,
+    ) -> Self {
         let (sender, receiver) = mpsc::channel(channel_buffer);
         let active = Arc::new(ArcSwap::from_pointee(ActiveSegment::default()));
         let sealed = Arc::new(ArcSwap::from_pointee(SealedSegments::default()));
@@ -263,23 +316,23 @@ impl PartitionHandle {
         {
             let sealed = sealed.clone();
             let active = active.clone();
-            let actor = PartitionActor::new(receiver, sealed, active, segment_size);
-            tokio::spawn(run_partition_actor(actor));
+            let actor = PartitionActor::new(receiver, sealed, active, segment_size, shutdown_token);
+            tasks.spawn(run_partition_actor(actor));
         }
 
         Self { sender }
     }
 
-    async fn append(&self, entry: Bytes) -> u64 {
+    async fn append(&self, entry: Bytes) -> Result<u64, StorageErr> {
         let (reply_to, reply) = oneshot::channel();
 
-        // if send fails reply.await will fail too - no need to check twice
+        // only valid reason to fail
         self.sender
             .send(PartitionMsg::Append { entry, reply_to })
             .await
-            .unwrap();
+            .map_err(|_| StorageErr::ShuttingDown)?;
 
-        reply.await.expect("fatal: partition actor broken!")
+        Ok(reply.await.map_err(|_| StorageErr::InternalError)?)
     }
 }
 
@@ -357,413 +410,5 @@ impl ActiveSegment {
             }
             idx += 1;
         }
-    }
-}
-
-// TODO: delte it all
-
-struct LogStore<T> {
-    logs: HashMap<LogId, Vec<Option<T>>>,
-}
-
-impl<T> Default for LogStore<T> {
-    fn default() -> Self {
-        Self {
-            logs: HashMap::new(),
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct Logs<T> {
-    inner: Arc<tokio::sync::RwLock<LogStore<T>>>,
-}
-
-impl<T> LogStore<T> {
-    fn append(&mut self, key: LogId, msg: T, offset: Offset) -> Result<(), StorageErr> {
-        let log = self.logs.entry(key).or_insert(vec![]);
-        let offset = offset.0 as usize;
-
-        if offset < log.len() {
-            return Err(StorageErr::InvalidOffset {
-                current: log.len(),
-                requested: offset,
-            });
-        }
-
-        if offset > log.len() {
-            log.resize_with(offset, || None);
-        }
-
-        log.push(Some(msg));
-        Ok(())
-    }
-
-    fn next_offset(&self, key: &LogId) -> Offset {
-        Offset(self.logs.get(key).map(|log| log.len()).unwrap_or(0) as u64)
-    }
-
-    fn poll(
-        &self,
-        offsets: HashMap<LogId, Offset>,
-        limit: usize,
-    ) -> HashMap<LogId, Vec<(Offset, T)>>
-    where
-        T: Clone,
-    {
-        offsets
-            .into_iter()
-            .map(|(key, offset)| {
-                let msgs = self
-                    .logs
-                    .get(&key)
-                    .map(|stored| {
-                        stored
-                            .iter()
-                            .skip(offset.0 as usize)
-                            .take(limit)
-                            .enumerate()
-                            .map_while(|(i, msg)| {
-                                msg.clone().map(|msg| (Offset(offset.0 + i as u64), msg))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                (key, msgs)
-            })
-            .collect()
-    }
-
-    fn merge(&mut self, other: HashMap<LogId, Vec<(Offset, Vec<T>)>>) -> Result<(), StorageErr>
-    where
-        T: PartialEq + Debug,
-    {
-        for (key, sparsed_msgs) in other.into_iter() {
-            let log = self.logs.entry(key).or_default();
-            for (start, msgs) in sparsed_msgs {
-                let start = start.0 as usize;
-                if log.len() < start + msgs.len() {
-                    log.resize_with(start + msgs.len(), || None);
-                }
-
-                for (i, (slot, msg)) in log.iter_mut().skip(start).zip(msgs).enumerate() {
-                    if let Some(eslot) = slot
-                        && *eslot != msg
-                    {
-                        return Err(StorageErr::ConflictingData {
-                            existing: format!("{eslot:?}"),
-                            received: format!("{msg:?}"),
-                            offset: i + start,
-                        });
-                    }
-                    *slot = Some(msg);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn digest(&self) -> HashMap<LogId, Offset> {
-        self.logs
-            .iter()
-            .filter_map(|(key, log)| {
-                if log.is_empty() {
-                    return None;
-                }
-
-                let offset = log.iter().take_while(|msg| msg.is_some()).count();
-                if offset == 0 {
-                    None
-                } else {
-                    Some((key.clone(), Offset((offset - 1) as u64)))
-                }
-            })
-            .collect()
-    }
-
-    fn diff(&self, offsets: HashMap<LogId, Offset>) -> HashMap<LogId, Vec<(Offset, Vec<T>)>>
-    where
-        T: Clone,
-    {
-        offsets
-            .into_iter()
-            .filter_map(|(key, offset)| {
-                let log = self.logs.get(&key)?;
-
-                let mut res = Vec::new();
-                let mut cur: Option<(Offset, Vec<T>)> = None;
-
-                for (log_offset, msg) in log.iter().enumerate().skip(offset.0 as usize + 1) {
-                    match msg {
-                        None => {
-                            if let Some(c) = cur.take() {
-                                res.push(c);
-                            }
-                        }
-                        Some(msg) => {
-                            if let Some((_, msgs)) = &mut cur {
-                                msgs.push(msg.clone());
-                            } else {
-                                cur = Some((Offset(log_offset as u64), vec![msg.clone()]));
-                            }
-                        }
-                    }
-                }
-                if let Some(c) = cur {
-                    res.push(c);
-                }
-
-                (!res.is_empty()).then_some((key, res))
-            })
-            .collect()
-    }
-}
-
-impl<T> Default for Logs<T> {
-    fn default() -> Self {
-        Self {
-            inner: Arc::new(tokio::sync::RwLock::new(LogStore::default())),
-        }
-    }
-}
-
-impl<T> Logs<T> {
-    pub async fn append(&self, key: LogId, msg: T, offset: Offset) -> Result<(), StorageErr> {
-        self.inner.write().await.append(key, msg, offset)
-    }
-
-    pub async fn next_offset(&self, key: &LogId) -> Offset {
-        self.inner.read().await.next_offset(key)
-    }
-
-    pub async fn poll(
-        &self,
-        offsets: HashMap<LogId, Offset>,
-        limit: usize,
-    ) -> HashMap<LogId, Vec<(Offset, T)>>
-    where
-        T: Clone,
-    {
-        self.inner.read().await.poll(offsets, limit)
-    }
-
-    pub async fn merge(
-        &self,
-        other: HashMap<LogId, Vec<(Offset, Vec<T>)>>,
-    ) -> Result<(), StorageErr>
-    where
-        T: PartialEq + Debug,
-    {
-        self.inner.write().await.merge(other)
-    }
-
-    pub async fn digest(&self) -> HashMap<LogId, Offset> {
-        self.inner.read().await.digest()
-    }
-
-    pub async fn diff(
-        &self,
-        offsets: HashMap<LogId, Offset>,
-    ) -> HashMap<LogId, Vec<(Offset, Vec<T>)>>
-    where
-        T: Clone,
-    {
-        self.inner.read().await.diff(offsets)
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use std::collections::HashMap;
-
-    fn key(value: &str) -> LogId {
-        LogId(value.to_owned())
-    }
-
-    fn offset(value: u64) -> Offset {
-        Offset(value)
-    }
-
-    #[test]
-    fn append_sparse() {
-        let mut logs = LogStore::default();
-
-        logs.append(key("a"), 10, offset(0)).unwrap();
-        logs.append(key("a"), 20, offset(1)).unwrap();
-        logs.append(key("a"), 30, offset(4)).unwrap();
-
-        assert_eq!(
-            logs.logs[&key("a")],
-            vec![Some(10), Some(20), None, None, Some(30)]
-        );
-    }
-
-    #[test]
-    fn append_invalid_offset() {
-        let mut logs = LogStore::default();
-
-        logs.append(key("a"), 1, offset(0)).unwrap();
-
-        assert!(matches!(
-            logs.append(key("a"), 2, offset(0)),
-            Err(StorageErr::InvalidOffset { .. })
-        ));
-    }
-
-    #[test]
-    fn poll_stops_at_gap() {
-        let mut logs = LogStore::default();
-
-        logs.logs
-            .insert(key("a"), vec![Some(1), Some(2), None, Some(4)]);
-
-        let mut offsets = HashMap::new();
-        offsets.insert(key("a"), offset(0));
-
-        let res = logs.poll(offsets, 10);
-
-        assert_eq!(res[&key("a")], vec![(offset(0), 1), (offset(1), 2)]);
-    }
-
-    #[test]
-    fn poll_limit() {
-        let mut logs = LogStore::default();
-
-        logs.logs
-            .insert(key("a"), vec![Some(1), Some(2), Some(3), Some(4)]);
-
-        let mut offsets = HashMap::new();
-        offsets.insert(key("a"), offset(0));
-
-        let res = logs.poll(offsets, 2);
-
-        assert_eq!(res[&key("a")], vec![(offset(0), 1), (offset(1), 2)]);
-    }
-
-    #[test]
-    fn merge_into_empty() {
-        let mut logs = LogStore::default();
-
-        let mut other = HashMap::new();
-        other.insert(key("a"), vec![(offset(2), vec![10, 11])]);
-
-        logs.merge(other).unwrap();
-
-        assert_eq!(logs.logs[&key("a")], vec![None, None, Some(10), Some(11)]);
-    }
-
-    #[test]
-    fn merge_fill_gap() {
-        let mut logs = LogStore::default();
-        logs.logs
-            .insert(key("a"), vec![Some(1), None, Some(3), Some(4), None]);
-
-        let mut other = HashMap::new();
-        other.insert(
-            key("a"),
-            vec![(offset(1), vec![2]), (offset(4), vec![5, 6])],
-        );
-
-        logs.merge(other).unwrap();
-
-        assert_eq!(
-            logs.logs[&key("a")],
-            vec![Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)]
-        );
-    }
-
-    #[test]
-    fn digest_contiguous_prefix() {
-        let mut logs = LogStore::default();
-
-        logs.logs
-            .insert(key("a"), vec![Some(1), Some(2), None, Some(4)]);
-        logs.logs
-            .insert(key("b"), vec![Some(1), None, None, Some(4)]);
-
-        let digest = logs.digest();
-
-        assert_eq!(digest[&key("a")], offset(1));
-        assert_eq!(digest[&key("b")], offset(0));
-    }
-
-    #[test]
-    fn diff_multiple_segments() {
-        let mut logs = LogStore::default();
-        logs.logs.insert(
-            key("a"),
-            vec![Some(1), Some(2), None, Some(4), Some(5), None, Some(7)],
-        );
-
-        let mut offsets = HashMap::new();
-        offsets.insert(key("a"), offset(0));
-
-        let diff = logs.diff(offsets);
-
-        assert_eq!(
-            diff[&key("a")],
-            vec![
-                (offset(1), vec![2]),
-                (offset(3), vec![4, 5]),
-                (offset(6), vec![7]),
-            ]
-        );
-    }
-
-    #[test]
-    fn diff_starts_with_gap() {
-        let mut logs = LogStore::default();
-        logs.logs
-            .insert(key("a"), vec![None, None, Some(3), Some(4)]);
-
-        let mut offsets = HashMap::new();
-        offsets.insert(key("a"), offset(0));
-
-        let diff = logs.diff(offsets);
-
-        assert_eq!(diff[&key("a")], vec![(offset(2), vec![3, 4])]);
-    }
-
-    #[test]
-    fn diff_merge_roundtrip() {
-        let mut alog = LogStore::default();
-        let mut blog = LogStore::default();
-
-        alog.logs.insert(
-            key("a"),
-            vec![Some(1), Some(2), None, Some(4), Some(5), None, Some(7)],
-        );
-
-        blog.logs.insert(key("a"), vec![Some(1), Some(2)]);
-
-        let digest = blog.digest();
-        assert_eq!(digest[&key("a")], offset(1));
-
-        let diff = alog.diff(digest);
-        assert_eq!(
-            diff[&key("a")],
-            vec![(offset(3), vec![4, 5]), (offset(6), vec![7])],
-        );
-
-        blog.merge(diff).unwrap();
-
-        assert_eq!(alog.logs, blog.logs);
-    }
-
-    #[test]
-    fn merge_detect_conflict() {
-        let mut logs = LogStore::default();
-
-        logs.logs.insert(key("a"), vec![Some(1), Some(2)]);
-
-        let mut other = HashMap::new();
-        other.insert(key("a"), vec![(offset(1), vec![42])]);
-
-        assert!(matches!(
-            logs.merge(other),
-            Err(StorageErr::ConflictingData { .. })
-        ));
     }
 }
