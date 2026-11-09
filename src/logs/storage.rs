@@ -53,8 +53,18 @@ pub struct StoreConfig {
     grace_duration: Duration,
 }
 
+impl Default for StoreConfig {
+    fn default() -> Self {
+        Self {
+            channel_buffer: 128,
+            segment_size: 1024,
+            grace_duration: Duration::from_secs(5),
+        }
+    }
+}
+
 /// Logs storage. DashMap for sharding, actor for each topic. Topics created dynamically on append.
-struct Store {
+pub struct Store {
     partitions: DashMap<String, Partition>,
     config: StoreConfig,
     shutdown_token: CancellationToken,
@@ -62,7 +72,7 @@ struct Store {
 }
 
 impl Store {
-    fn new(config: StoreConfig, shutdown_token: CancellationToken) -> Self {
+    pub fn new(config: StoreConfig, shutdown_token: CancellationToken) -> Self {
         Self {
             partitions: DashMap::new(),
             config,
@@ -184,8 +194,6 @@ impl PartitionReader {
         Some(result)
     }
 }
-
-// -- Actor
 
 enum PartitionMsg {
     Append {
@@ -332,7 +340,7 @@ impl PartitionHandle {
             .await
             .map_err(|_| StorageErr::ShuttingDown)?;
 
-        Ok(reply.await.map_err(|_| StorageErr::InternalError)?)
+        reply.await.map_err(|_| StorageErr::InternalError)
     }
 }
 

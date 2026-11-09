@@ -1,9 +1,7 @@
-#![allow(
-    dead_code,
-    reason = "forwarding is introduced before ownership routing is connected"
-)]
-
 mod outbound;
 mod pending;
+mod reply_cache;
+mod request;
 
-pub use outbound::{Transport, TransportErr};
+pub use outbound::{RpcConfig, Transport, TransportErr};
+pub use request::{PeerRequest, RequestId, new_incarnation};

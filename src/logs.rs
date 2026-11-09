@@ -5,4 +5,4 @@
 
 mod storage;
 
-pub use storage::{Logs, StorageErr};
+pub use storage::{StorageErr, Store, StoreConfig};

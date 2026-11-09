@@ -3,13 +3,11 @@ use crate::{io::stdio::StdioReader, io::stdio::StdioWriter, node::Config};
 use tokio::{self};
 
 mod app;
-mod domain;
 mod io;
 mod logs;
 mod maelstrom;
 mod message;
 mod node;
-mod replication;
 mod transport;
 
 fn init_tracing() {

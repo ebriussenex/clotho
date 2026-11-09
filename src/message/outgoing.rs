@@ -1,56 +1,47 @@
 use crate::{
-    app::{Command, CommandResponse, ListCommittedOffsetsRes, PollRes, SendRes},
-    maelstrom::protocol::wire::{Body, Msg, Payload},
-    replication::{LogDelta, ReplicationMessage},
+    app::{
+        Command, CommandError, CommandResponse, CommitOffsetsCommand, ListCommittedOffsetsCommand,
+        ListCommittedOffsetsRes, PollCommand, PollRes, SendCommand, SendRes,
+    },
+    maelstrom::protocol::wire::{self, Body, ForwardedPayload, Msg, Payload},
+    transport::RequestId,
 };
 
-#[allow(
-    dead_code,
-    reason = "forwarding and replication producers are not connected yet"
-)]
+use super::error_code;
+
 pub enum Outgoing {
     CommandReply {
-        msg_id: usize,
+        msg_id: u64,
         response: CommandResponse,
-        in_reply_to: usize,
+        in_reply_to: u64,
+        dest: String,
+    },
+    ErrorReply {
+        msg_id: u64,
+        error: CommandError,
+        in_reply_to: u64,
         dest: String,
     },
     Forward {
         command: Command,
-        msg_id: usize,
+        msg_id: u64,
         dest: String,
-    },
-    Replication {
-        message: ReplicationMessage,
-        msg_id: usize,
-        dest: String,
+        request_id: RequestId,
+        watermark: u64,
     },
 }
 
-impl From<Command> for Payload {
+impl From<Command> for ForwardedPayload {
     fn from(command: Command) -> Self {
         match command {
-            Command::Send(command) => Payload::Send {
-                key: command.key.0,
-                msg: command.msg,
-            },
-            Command::Poll(command) => Payload::Poll {
-                offsets: command
-                    .offsets
-                    .into_iter()
-                    .map(|(key, offset)| (key.0, offset.0 as usize))
-                    .collect(),
-            },
-            Command::CommitOffsets(command) => Payload::CommitOffsets {
-                offsets: command
-                    .offsets
-                    .into_iter()
-                    .map(|(key, offset)| (key.0, offset.0 as usize))
-                    .collect(),
-            },
-            Command::ListCommittedOffsets(command) => Payload::ListCommittedOffsets {
-                keys: command.keys.into_iter().map(|key| key.0).collect(),
-            },
+            Command::Send(SendCommand { key, msg }) => ForwardedPayload::Send { key, msg },
+            Command::Poll(PollCommand { offsets }) => ForwardedPayload::Poll { offsets },
+            Command::CommitOffsets(CommitOffsetsCommand { offsets }) => {
+                ForwardedPayload::CommitOffsets { offsets }
+            }
+            Command::ListCommittedOffsets(ListCommittedOffsetsCommand { keys }) => {
+                ForwardedPayload::ListCommittedOffsets { keys }
+            }
         }
     }
 }
@@ -58,58 +49,30 @@ impl From<Command> for Payload {
 impl From<CommandResponse> for Payload {
     fn from(res: CommandResponse) -> Self {
         match res {
-            CommandResponse::Send(SendRes { offset }) => Payload::SendOk {
-                offset: offset.0 as usize,
-            },
-            CommandResponse::Poll(PollRes { msgs }) => Payload::PollOk {
-                msgs: msgs
-                    .into_iter()
-                    .map(|(key, msgs)| {
-                        (
-                            key.0,
-                            msgs.into_iter()
-                                .map(|(offset, msg)| (offset.0 as usize, msg))
-                                .collect(),
-                        )
-                    })
-                    .collect(),
-            },
+            CommandResponse::Send(SendRes { offset }) => Payload::SendOk { offset },
+            CommandResponse::Poll(PollRes { msgs }) => Payload::PollOk { msgs },
             CommandResponse::CommitOffsets => Payload::CommitOffsetsOk,
             CommandResponse::ListCommittedOffsets(ListCommittedOffsetsRes { offsets }) => {
-                Payload::ListCommittedOffsetsOk {
-                    offsets: offsets
-                        .into_iter()
-                        .map(|(key, offset)| (key.0, offset.0 as usize))
-                        .collect(),
-                }
+                Payload::ListCommittedOffsetsOk { offsets }
             }
         }
     }
 }
 
-impl From<ReplicationMessage> for Payload {
-    fn from(message: ReplicationMessage) -> Self {
-        match message {
-            ReplicationMessage::LogDigest(offsets) => Payload::GossipDigest {
-                digest: offsets
-                    .into_iter()
-                    .map(|(key, offset)| (key.0, offset.0 as usize))
-                    .collect(),
-            },
-            ReplicationMessage::LogDelta(LogDelta { msgs }) => Payload::GossipDiff {
-                msgs: msgs
-                    .into_iter()
-                    .map(|(key, chunks)| {
-                        (
-                            key.0,
-                            chunks
-                                .into_iter()
-                                .map(|(offset, msgs)| (offset.0 as usize, msgs))
-                                .collect(),
-                        )
-                    })
-                    .collect(),
-            },
+impl From<CommandError> for Payload {
+    fn from(error: CommandError) -> Self {
+        Payload::Error {
+            code: error_code::to_code(error.kind),
+            text: error.text,
+        }
+    }
+}
+
+impl From<RequestId> for wire::RequestId {
+    fn from(id: RequestId) -> Self {
+        wire::RequestId {
+            incarnation: id.incarnation,
+            seq: id.seq,
         }
     }
 }
@@ -122,41 +85,92 @@ impl Outgoing {
                 in_reply_to,
                 dest,
                 msg_id,
-            } => Msg {
-                src: node_id.to_string(),
+            } => reply_msg(node_id, dest, msg_id, in_reply_to, response.into()),
+            Outgoing::ErrorReply {
+                error,
+                in_reply_to,
                 dest,
-                body: Body {
-                    id: Some(msg_id),
-                    in_reply_to: Some(in_reply_to),
-                    payload: response.into(),
-                },
-            },
+                msg_id,
+            } => reply_msg(node_id, dest, msg_id, in_reply_to, error.into()),
             Outgoing::Forward {
                 command,
                 msg_id,
                 dest,
+                request_id,
+                watermark,
             } => Msg {
                 src: node_id.to_string(),
                 dest,
                 body: Body {
                     id: Some(msg_id),
                     in_reply_to: None,
-                    payload: command.into(),
-                },
-            },
-            Outgoing::Replication {
-                message,
-                msg_id,
-                dest,
-            } => Msg {
-                src: node_id.to_string(),
-                dest,
-                body: Body {
-                    id: Some(msg_id),
-                    in_reply_to: None,
-                    payload: message.into(),
+                    payload: Payload::Fwd {
+                        request_id: request_id.into(),
+                        watermark,
+                        payload: command.into(),
+                    },
                 },
             },
         }
+    }
+}
+
+fn reply_msg(
+    node_id: &str,
+    dest: String,
+    msg_id: u64,
+    in_reply_to: u64,
+    payload: Payload,
+) -> Msg<Payload> {
+    Msg {
+        src: node_id.to_string(),
+        dest,
+        body: Body {
+            id: Some(msg_id),
+            in_reply_to: Some(in_reply_to),
+            payload,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn forward_serializes_as_nested_fwd() {
+        let msg = Outgoing::Forward {
+            command: Command::Send(SendCommand {
+                key: "k1".to_owned(),
+                msg: 7,
+            }),
+            msg_id: 42,
+            dest: "n2".to_owned(),
+            request_id: RequestId {
+                incarnation: 913,
+                seq: 17,
+            },
+            watermark: 15,
+        }
+        .into_msg("n1");
+
+        let value = serde_json::to_value(&msg).expect("serializable");
+        assert_eq!(
+            value,
+            json!({
+                "src": "n1",
+                "dest": "n2",
+                "body": {
+                    "type": "fwd",
+                    "msg_id": 42,
+                    "in_reply_to": null,
+                    "request_id": {"incarnation": 913, "seq": 17},
+                    "watermark": 15,
+                    "payload": {"type": "send", "key": "k1", "msg": 7}
+                }
+            })
+        );
     }
 }

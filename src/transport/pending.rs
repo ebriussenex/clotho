@@ -1,19 +1,19 @@
 use std::{
-    collections::{HashMap, hash_map::Entry},
-    sync::Arc,
+    collections::HashMap,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::mpsc;
 
-use crate::app::CommandResponse;
+use crate::app::{CommandError, CommandResponse};
 
 use super::TransportErr;
 
-type PendingReplies = HashMap<usize, oneshot::Sender<CommandResponse>>;
+pub type Reply = Result<CommandResponse, CommandError>;
 
 #[derive(Clone)]
 pub struct PendingTable {
-    replies: Arc<Mutex<PendingReplies>>,
+    replies: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Reply>>>>,
 }
 
 impl PendingTable {
@@ -23,29 +23,115 @@ impl PendingTable {
         }
     }
 
-    pub async fn add(&self, msg_id: usize) -> oneshot::Receiver<CommandResponse> {
-        let (tx, rx) = oneshot::channel();
-        self.replies.lock().await.insert(msg_id, tx);
-        rx
+    pub fn attempts(&self) -> Attempts<'_> {
+        Attempts {
+            table: self,
+            msg_ids: Vec::new(),
+        }
     }
 
-    pub async fn register(
-        &self,
-        msg_id: usize,
-        response: CommandResponse,
-    ) -> Result<(), TransportErr> {
-        let mut replies = self.replies.lock().await;
-        let Entry::Occupied(entry) = replies.entry(msg_id) else {
+    pub fn register(&self, msg_id: u64, reply: Reply) -> Result<(), TransportErr> {
+        let Some(reply_tx) = self.lock().remove(&msg_id) else {
             return Err(TransportErr::NotAwaited);
         };
 
-        entry
-            .remove()
-            .send(response)
-            .map_err(|_| TransportErr::chan_send::<CommandResponse>("command_reply_tx"))
+        reply_tx.send(reply).map_err(|_| TransportErr::NotAwaited)
     }
 
-    pub async fn remove(&self, msg_id: usize) {
-        self.replies.lock().await.remove(&msg_id);
+    fn add(&self, msg_id: u64, reply_tx: mpsc::UnboundedSender<Reply>) {
+        self.lock().insert(msg_id, reply_tx);
+    }
+
+    fn remove(&self, msg_ids: &[u64]) {
+        let mut replies = self.lock();
+        for msg_id in msg_ids {
+            replies.remove(msg_id);
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, HashMap<u64, mpsc::UnboundedSender<Reply>>> {
+        self.replies.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+pub struct Attempts<'a> {
+    table: &'a PendingTable,
+    msg_ids: Vec<u64>,
+}
+
+impl Attempts<'_> {
+    pub fn add(&mut self, msg_id: u64, reply_tx: mpsc::UnboundedSender<Reply>) {
+        self.table.add(msg_id, reply_tx);
+        self.msg_ids.push(msg_id);
+    }
+}
+
+impl Drop for Attempts<'_> {
+    fn drop(&mut self) {
+        self.table.remove(&self.msg_ids);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::app::SendRes;
+
+    use super::*;
+
+    fn send_ok(offset: u64) -> Reply {
+        Ok(CommandResponse::Send(SendRes { offset }))
+    }
+
+    #[test]
+    fn reply_to_any_attempt_reaches_the_request() {
+        let table = PendingTable::new();
+        let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
+        let mut attempts = table.attempts();
+        attempts.add(1, reply_tx.clone());
+        attempts.add(2, reply_tx);
+
+        table
+            .register(1, send_ok(7))
+            .expect("first attempt is awaited");
+
+        assert!(matches!(
+            reply_rx.try_recv(),
+            Ok(Ok(CommandResponse::Send(SendRes { offset: 7 })))
+        ));
+    }
+
+    #[test]
+    fn duplicate_reply_is_not_awaited() {
+        let table = PendingTable::new();
+        let (reply_tx, _reply_rx) = mpsc::unbounded_channel();
+        let mut attempts = table.attempts();
+        attempts.add(1, reply_tx);
+
+        table
+            .register(1, send_ok(7))
+            .expect("first reply is awaited");
+        assert!(matches!(
+            table.register(1, send_ok(7)),
+            Err(TransportErr::NotAwaited)
+        ));
+    }
+
+    #[test]
+    fn dropping_attempts_untracks_them() {
+        let table = PendingTable::new();
+        let (reply_tx, _reply_rx) = mpsc::unbounded_channel();
+        let mut attempts = table.attempts();
+        attempts.add(1, reply_tx.clone());
+        attempts.add(2, reply_tx);
+        drop(attempts);
+
+        assert!(matches!(
+            table.register(1, send_ok(7)),
+            Err(TransportErr::NotAwaited)
+        ));
+        assert!(matches!(
+            table.register(2, send_ok(7)),
+            Err(TransportErr::NotAwaited)
+        ));
     }
 }

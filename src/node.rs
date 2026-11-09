@@ -1,13 +1,13 @@
 use crate::{
-    app::{App, AppCommand, AppErr, CommitedOffsets},
+    app::{App, AppCommand, AppErr, CommitedOffsets, Ownership},
     io::{IoError, MessageReader, MessageWriter},
-    logs::Logs,
+    logs::{Store, StoreConfig},
     maelstrom::protocol::wire::Payload,
     message::{self, DropReason, Incoming},
-    transport::{Transport, TransportErr},
+    transport::{self, RpcConfig, Transport, TransportErr},
 };
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use thiserror::Error;
 use tokio::{
@@ -57,14 +57,20 @@ impl HandleErr {
 
 pub struct Config {
     poll_max_msgs_size: usize,
-    request_timeout: Duration,
+    rpc: RpcConfig,
+    max_in_flight_commands: usize,
+    /// Rendezvous hashing seed. Must be identical on every node; will come from the
+    /// configuration (env) later.
+    ownership_seed: u64,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
             poll_max_msgs_size: 100,
-            request_timeout: Duration::from_millis(1000),
+            rpc: RpcConfig::default(),
+            max_in_flight_commands: 64,
+            ownership_seed: 0,
         }
     }
 }
@@ -72,7 +78,7 @@ impl Default for Config {
 pub async fn run<R, W>(
     config: Config,
     node_id: &str,
-    _peer_ids: &[String],
+    peer_ids: &[String],
     reader: R,
     writer: W,
 ) -> Result<(), NodeErr>
@@ -81,13 +87,18 @@ where
     W: MessageWriter,
 {
     let (write_tx, write_rx) = mpsc::channel(32);
-    let (client_tx, client_rx) = mpsc::channel(32);
+    let (command_tx, command_rx) = mpsc::channel(32);
 
     let mut join_set = JoinSet::new();
     let token = CancellationToken::new();
-    let transport = Transport::new(write_tx, config.request_timeout);
-    let logs = Logs::<u32>::default();
+    let transport = Transport::new(write_tx, config.rpc, transport::new_incarnation());
+    let logs = Store::new(StoreConfig::default(), token.child_token());
     let commited_offsets = CommitedOffsets::new();
+    let ownership = Ownership::new(
+        node_id.to_owned(),
+        peer_ids.iter().cloned(),
+        config.ownership_seed,
+    );
 
     let node_id: Arc<str> = Arc::from(node_id);
     // let replication = Replication::new(logs.clone(), transport.clone(), node_ids.clone());
@@ -95,7 +106,7 @@ where
     join_set.spawn({
         let token = token.clone();
         let transport = transport.clone();
-        async move { receive_and_dispatch(token, client_tx, transport, reader).await }
+        async move { receive_and_dispatch(token, command_tx, transport, reader).await }
     });
 
     join_set.spawn({
@@ -106,14 +117,19 @@ where
     join_set.spawn({
         let token = token.clone();
         let transport = transport.clone();
-        let logs = logs.clone();
-        let commited_offsets = commited_offsets.clone();
 
         async move {
-            App::new(logs, transport, commited_offsets, config.poll_max_msgs_size)
-                .run(token, client_rx)
-                .await
-                .map_err(HandleErr::from)
+            App::new(
+                logs,
+                transport,
+                commited_offsets,
+                ownership,
+                config.poll_max_msgs_size,
+                config.max_in_flight_commands,
+            )
+            .run(token, command_rx)
+            .await
+            .map_err(HandleErr::from)
         }
     });
 
@@ -177,7 +193,7 @@ where
 
 async fn receive_and_dispatch(
     token: CancellationToken,
-    client_tx: mpsc::Sender<AppCommand>,
+    command_tx: mpsc::Sender<AppCommand>,
     transport: Transport,
     mut reader: impl MessageReader,
 ) -> Result<(), HandleErr> {
@@ -192,21 +208,18 @@ async fn receive_and_dispatch(
         match msg? {
             Some(msg) => match msg.classify() {
                 Ok(msg) => match msg {
-                    Incoming::AppCommand(command) => client_tx
-                        .send(command)
-                        .await
-                        .map_err(|_| HandleErr::chan_send::<AppCommand>("client_tx"))?,
+                    Incoming::AppCommand(command) => {
+                        // retries of peer requests are answered or dropped by transport
+                        if transport.admit(&command.reply_ctx).await? {
+                            command_tx
+                                .send(command)
+                                .await
+                                .map_err(|_| HandleErr::chan_send::<AppCommand>("command_tx"))?;
+                        }
+                    }
                     Incoming::CommandReply(reply) => {
                         tracing::debug!(src = %reply.src, in_reply_to = reply.in_reply_to, "received command reply");
-                        transport
-                            .register_reply(reply.in_reply_to, reply.response)
-                            .await?;
-                    }
-                    Incoming::ReplicationCommand(command) => {
-                        drop(command);
-                        tracing::debug!(
-                            "ignoring replication command while replication is disabled"
-                        );
+                        transport.register_reply(reply.in_reply_to, reply.result);
                     }
                 },
                 Err(reason) => match reason {
@@ -214,7 +227,6 @@ async fn receive_and_dispatch(
                     DropReason::NoInReplyTo => {
                         Err(HandleErr::Msg(MsgErr::MissingField("in_reply_to")))?
                     }
-                    DropReason::Ignored => (),
                 },
             },
             None => return Ok(()),

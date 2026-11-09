@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone)]
 pub struct Envelope {
     pub src: String,
-    pub msg_id: Option<usize>,
-    pub in_reply_to: Option<usize>,
+    pub msg_id: Option<u64>,
+    pub in_reply_to: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,8 +29,8 @@ impl<Payload> Msg<Payload> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Body<Payload> {
     #[serde(rename = "msg_id")]
-    pub id: Option<usize>,
-    pub in_reply_to: Option<usize>,
+    pub id: Option<u64>,
+    pub in_reply_to: Option<u64>,
     #[serde(flatten)]
     pub payload: Payload,
 }
@@ -44,32 +44,48 @@ pub enum Payload {
         msg: u32,
     },
     SendOk {
-        offset: usize,
+        offset: u64,
     },
     Poll {
-        offsets: HashMap<String, usize>,
+        offsets: HashMap<String, u64>,
     },
     PollOk {
-        msgs: HashMap<String, Vec<(usize, u32)>>,
+        msgs: HashMap<String, Vec<(u64, u32)>>,
     },
     CommitOffsets {
-        offsets: HashMap<String, usize>,
+        offsets: HashMap<String, u64>,
     },
     CommitOffsetsOk,
     ListCommittedOffsets {
         keys: Vec<String>,
     },
     ListCommittedOffsetsOk {
-        offsets: HashMap<String, usize>,
+        offsets: HashMap<String, u64>,
+    },
+    Fwd {
+        request_id: RequestId,
+        watermark: u64,
+        payload: ForwardedPayload,
     },
     Error {
         code: u8,
         text: String,
     },
-    GossipDigest {
-        digest: HashMap<String, usize>,
-    },
-    GossipDiff {
-        msgs: HashMap<String, Vec<(usize, Vec<u32>)>>,
-    },
+}
+
+/// Identity of one logical internode request, stable across its retries.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct RequestId {
+    pub incarnation: u64,
+    pub seq: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum ForwardedPayload {
+    Send { key: String, msg: u32 },
+    Poll { offsets: HashMap<String, u64> },
+    CommitOffsets { offsets: HashMap<String, u64> },
+    ListCommittedOffsets { keys: Vec<String> },
 }

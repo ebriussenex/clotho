@@ -1,9 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use crate::{
-    app::{CommitOffsetsCommand, ListCommittedOffsetsCommand},
-    domain::{LogId, Offset},
-};
+use crate::app::{CommitOffsetsCommand, ListCommittedOffsetsCommand};
 
 #[derive(Clone)]
 pub struct CommitedOffsets {
@@ -12,7 +9,7 @@ pub struct CommitedOffsets {
 
 #[derive(Default)]
 struct CommitedOffsetsStore {
-    offsets: HashMap<LogId, Offset>,
+    offsets: HashMap<String, u64>,
 }
 
 impl CommitedOffsetsStore {
@@ -25,7 +22,7 @@ impl CommitedOffsetsStore {
         });
     }
 
-    fn list(&self, command: &ListCommittedOffsetsCommand) -> HashMap<LogId, Offset> {
+    fn list(&self, command: &ListCommittedOffsetsCommand) -> HashMap<String, u64> {
         command
             .keys
             .iter()
@@ -45,7 +42,7 @@ impl CommitedOffsets {
         self.inner.write().await.commit(command)
     }
 
-    pub async fn list(&self, command: &ListCommittedOffsetsCommand) -> HashMap<LogId, Offset> {
+    pub async fn list(&self, command: &ListCommittedOffsetsCommand) -> HashMap<String, u64> {
         self.inner.read().await.list(command)
     }
 }
@@ -58,24 +55,18 @@ mod tests {
     async fn commit_and_list_requested_offsets() {
         let store = CommitedOffsets::new();
         let command = CommitOffsetsCommand {
-            offsets: HashMap::from([
-                (LogId("a".to_string()), Offset(10)),
-                (LogId("b".to_string()), Offset(20)),
-            ]),
+            offsets: HashMap::from([("a".to_string(), 10), ("b".to_string(), 20)]),
         };
 
         store.commit(&command).await;
 
         let listed = store
             .list(&ListCommittedOffsetsCommand {
-                keys: vec![LogId("a".to_string())],
+                keys: vec!["a".to_string()],
             })
             .await;
 
-        assert_eq!(
-            listed,
-            HashMap::from([(LogId("a".to_string()), Offset(10))])
-        );
+        assert_eq!(listed, HashMap::from([("a".to_string(), 10)]));
     }
 
     #[tokio::test]
@@ -84,24 +75,21 @@ mod tests {
 
         store
             .commit(&CommitOffsetsCommand {
-                offsets: HashMap::from([(LogId("a".to_string()), Offset(10))]),
+                offsets: HashMap::from([("a".to_string(), 10)]),
             })
             .await;
         store
             .commit(&CommitOffsetsCommand {
-                offsets: HashMap::from([(LogId("a".to_string()), Offset(30))]),
+                offsets: HashMap::from([("a".to_string(), 30)]),
             })
             .await;
 
         let listed = store
             .list(&ListCommittedOffsetsCommand {
-                keys: vec![LogId("a".to_string())],
+                keys: vec!["a".to_string()],
             })
             .await;
 
-        assert_eq!(
-            listed,
-            HashMap::from([(LogId("a".to_string()), Offset(30))])
-        );
+        assert_eq!(listed, HashMap::from([("a".to_string(), 30)]));
     }
 }
