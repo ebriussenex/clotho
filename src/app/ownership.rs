@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 pub struct Ownership {
     local: String,
     /// Sorted, deduplicated, always contains local.
@@ -26,6 +28,34 @@ impl Ownership {
     pub fn is_local(&self, key: &str) -> bool {
         self.owner(key) == self.local
     }
+
+    pub fn partition<T, C: Default + Extend<T>>(
+        &self,
+        items: impl IntoIterator<Item = T>,
+        key: impl Fn(&T) -> &str,
+    ) -> Partitioned<'_, C> {
+        let mut partitioned = Partitioned {
+            local: C::default(),
+            remote: HashMap::new(),
+        };
+
+        for item in items {
+            let owner = self.owner(key(&item));
+            if owner == self.local {
+                partitioned.local.extend([item]);
+            } else {
+                partitioned.remote.entry(owner).or_default().extend([item]);
+            }
+        }
+        partitioned
+    }
+}
+
+/// Items of a multi-key command split by owner.
+#[derive(Debug)]
+pub struct Partitioned<'a, C> {
+    pub local: C,
+    pub remote: HashMap<&'a str, C>,
 }
 
 #[cfg(test)]
@@ -109,6 +139,27 @@ mod tests {
             let (old, new) = (before.owner(&key), after.owner(&key));
             assert!(old == new || old == "n2", "{key}: {old} -> {new}");
         }
+    }
+
+    #[test]
+    fn partition_groups_items_by_owner() {
+        let ring = ownership("n1", &["n2", "n3"]);
+        let keys: Vec<String> = (0..100).map(|i| format!("key-{i}")).collect();
+
+        let partitioned: Partitioned<Vec<String>> = ring.partition(keys.clone(), String::as_str);
+
+        for key in &partitioned.local {
+            assert!(ring.is_local(key), "{key}");
+        }
+        for (owner, keys) in &partitioned.remote {
+            assert_ne!(*owner, "n1");
+            for key in keys {
+                assert_eq!(ring.owner(key), *owner, "{key}");
+            }
+        }
+        let total =
+            partitioned.local.len() + partitioned.remote.values().map(Vec::len).sum::<usize>();
+        assert_eq!(total, keys.len());
     }
 
     // not a contract test, rather a sanity check to catch possible degenerate bug in case `owner()

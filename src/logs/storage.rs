@@ -9,40 +9,59 @@ use tokio::{
 };
 use tokio_util::{bytes::Bytes, sync::CancellationToken, task::TaskTracker};
 
+/// Errors of the log storage.
+///
+/// Only [`Self::ShuttingDown`] and [`Self::InternalError`] are produced now; the other variants
+/// are reserved for replication and not returned yet.
 #[derive(Debug, Error)]
 pub enum StorageErr {
+    /// Reserved for replication: an offset beyond the end of the log.
     #[error("invalid offset requested: current: {current}, requested: {requested}")]
     InvalidOffset { current: usize, requested: usize },
+    /// Reserved for replication: a replica has different data at the same offset.
     #[error("merge conflict: existing: {existing}, received: {received}, offset: {offset}")]
     ConflictingData {
         existing: String,
         received: String,
         offset: usize,
     },
+    /// Reserved for replication.
     #[error("sender dropped")]
     SenderDropped,
+    /// Reserved for replication.
     #[error("receiver dropped")]
     ReceiverDropped,
+    /// Reserved for replication: the topic has no log on this node.
     #[error("requested topic not found")]
     TopicNotFound,
+    /// Reserved for replication.
     #[error("actor error: {0}")]
     Actor(#[from] ActorErr),
+    /// Reserved for replication: a storage task panicked.
     #[error("task panicked: {0}")]
     TaskPanicked(#[from] tokio::task::JoinError),
+    /// The storage is shutting down and accepts no appends. The append was not applied.
     #[error("storage is shutting down")]
     ShuttingDown,
+    /// A partition actor died before answering; the append may or may not have been applied.
+    /// A bug.
     #[error("internal error: partition actor died")]
     InternalError,
 }
 
+/// Reserved for replication: errors of partition actors. Not produced yet.
 #[derive(Debug, Error)]
 pub enum ActorErr {
+    /// The caller stopped waiting for the reply.
     #[error("response receiver hang up early")]
     HangUpEarly,
+    /// The request channel closed.
     #[error("sender dropped")]
     SenderDropped,
+    /// The reply channel closed.
     #[error("receiver dropped")]
     ReceiverDropped,
+    /// The actor task ended.
     #[error("actor gone")]
     ActorGone,
 }
@@ -81,8 +100,14 @@ impl Store {
         }
     }
 
-    /// Appends new entry to topic. `StorageErr::ShuttingDown` means that Storage is shutting down
-    /// and no new append requests accepted.
+    /// Appends `entry` to the log of `topic` and returns its offset. The log is created on the
+    /// first append.
+    ///
+    /// # Errors
+    ///
+    /// - [`StorageErr::ShuttingDown`] if the storage stopped accepting appends; the entry was
+    ///   not appended.
+    /// - [`StorageErr::InternalError`] if the partition actor died before answering.
     pub async fn append(&self, topic: &str, entry: Bytes) -> Result<u64, StorageErr> {
         if self.shutdown_token.is_cancelled() {
             return Err(StorageErr::ShuttingDown);
@@ -111,32 +136,40 @@ impl Store {
             .clone()
     }
 
-    /// Polls every listed topic from specified offset with limit
+    /// Reads at most `limit` entries of every topic, starting at the given offset. Returns the
+    /// start offset with the entries.
+    ///
+    /// Topics that don't exist or have no entries at or after the offset are left out.
     pub fn poll(
         &self,
-        offsets: &HashMap<String, u64>,
+        offsets: impl IntoIterator<Item = (String, u64)>,
         limit: usize,
     ) -> HashMap<String, (u64, Vec<Bytes>)> {
-        let mut result = HashMap::with_capacity(offsets.len());
+        let offsets = offsets.into_iter();
+        let mut result = HashMap::with_capacity(offsets.size_hint().0);
 
-        for (topic, &from_offset) in offsets {
+        for (topic, from_offset) in offsets {
             let Some(reader) = self
                 .partitions
-                .get(topic)
+                .get(&topic)
                 .map(|partition| partition.reader.clone())
             else {
                 continue;
             };
 
             if let Some(entries) = reader.read(from_offset, limit) {
-                result.insert(topic.clone(), (from_offset, entries));
+                result.insert(topic, (from_offset, entries));
             }
         }
         result
     }
 
-    /// Shuts down storage gracefully, waiting for append operations to complete while preventing
-    /// new appends during shutdown
+    /// Waits for the partition actors to finish the appends they already accepted. New appends
+    /// are refused once the shutdown token is cancelled.
+    ///
+    /// # Errors
+    ///
+    /// [`Elapsed`] if the actors didn't finish within the grace period.
     pub async fn shutdown(&self) -> Result<(), Elapsed> {
         self.tasks.close();
         tokio::time::timeout(self.config.grace_duration, self.tasks.wait()).await
@@ -157,10 +190,11 @@ impl Partition {
         tasks: &TaskTracker,
         shutdown_token: CancellationToken,
     ) -> Self {
-        Self {
-            handle: PartitionHandle::new(channel_buffer, segment_size, tasks, shutdown_token),
-            reader: PartitionReader::default(),
-        }
+        // the actor writes the very segments the reader reads
+        let reader = PartitionReader::default();
+        let handle =
+            PartitionHandle::new(channel_buffer, segment_size, &reader, tasks, shutdown_token);
+        Self { handle, reader }
     }
 }
 
@@ -314,19 +348,19 @@ impl PartitionHandle {
     pub fn new(
         channel_buffer: usize,
         segment_size: usize,
+        reader: &PartitionReader,
         tasks: &TaskTracker,
         shutdown_token: CancellationToken,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(channel_buffer);
-        let active = Arc::new(ArcSwap::from_pointee(ActiveSegment::default()));
-        let sealed = Arc::new(ArcSwap::from_pointee(SealedSegments::default()));
-
-        {
-            let sealed = sealed.clone();
-            let active = active.clone();
-            let actor = PartitionActor::new(receiver, sealed, active, segment_size, shutdown_token);
-            tasks.spawn(run_partition_actor(actor));
-        }
+        let actor = PartitionActor::new(
+            receiver,
+            Arc::clone(&reader.sealed),
+            Arc::clone(&reader.active),
+            segment_size,
+            shutdown_token,
+        );
+        tasks.spawn(run_partition_actor(actor));
 
         Self { sender }
     }
@@ -418,5 +452,48 @@ impl ActiveSegment {
             }
             idx += 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store(segment_size: usize) -> Store {
+        let config = StoreConfig {
+            segment_size,
+            ..StoreConfig::default()
+        };
+        Store::new(config, CancellationToken::new())
+    }
+
+    fn entry(i: u8) -> Bytes {
+        Bytes::copy_from_slice(&[i])
+    }
+
+    #[tokio::test]
+    async fn poll_sees_appended_entries_across_sealed_segments() {
+        let store = store(2);
+        for i in 0..5 {
+            assert_eq!(
+                store.append("t", entry(i)).await.expect("appended"),
+                u64::from(i)
+            );
+        }
+
+        let polled = store.poll([("t".to_owned(), 1)], 10);
+        assert_eq!(polled["t"], (1, (1..5).map(entry).collect::<Vec<_>>()));
+
+        let limited = store.poll([("t".to_owned(), 0)], 3);
+        assert_eq!(limited["t"], (0, (0..3).map(entry).collect::<Vec<_>>()));
+    }
+
+    #[tokio::test]
+    async fn poll_skips_unknown_and_exhausted_topics() {
+        let store = store(2);
+        store.append("t", entry(0)).await.expect("appended");
+
+        let polled = store.poll([("t".to_owned(), 1), ("other".to_owned(), 0)], 10);
+        assert!(polled.is_empty());
     }
 }

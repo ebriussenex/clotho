@@ -19,21 +19,30 @@ use crate::{
 use super::{
     pending::{PendingTable, Reply},
     reply_cache::{Admission, ReplyCache},
-    request::OutboundRequests,
+    request::{OutboundRequests, PeerRequest},
 };
 
+/// Errors of internode requests and of writing replies.
 #[derive(Debug, Error)]
 pub enum TransportErr {
+    /// A reply arrived for a `msg_id` nobody waits for: the request already completed, timed
+    /// out or was cancelled. Harmless, the reply is dropped.
     #[error("got response which was not awaited")]
     NotAwaited,
+    /// The peer did not answer before [`RpcConfig::deadline`]; the request may or may not have
+    /// been executed.
     #[error("timed out waiting for {0}")]
     Timeout(&'static str),
+    /// The reply channel closed. Cannot happen while [`Transport::forward`] holds its sender.
     #[error("response sender dropped: {0}")]
     SenderDropped(&'static str),
+    /// The node is stopping; nobody is to be answered.
     #[error("transport cancelled")]
     Cancelled,
+    /// The output task is gone, so the node can't send anything. Fatal.
     #[error("failed to send to {channel} channel")]
     ChanSend { channel: &'static str },
+    /// The peer replied with a non-retryable error, passed on to the client as is.
     #[error("peer replied with a non-retryable error: {0:?}")]
     Remote(CommandError),
 }
@@ -49,11 +58,16 @@ impl TransportErr {
     }
 }
 
+/// Retry policy of [`Transport::forward`].
 #[derive(Debug, Clone, Copy)]
 pub struct RpcConfig {
+    /// How long one attempt waits for its reply before the request is sent again.
     pub attempt_timeout: Duration,
+    /// Total time for all attempts of one request.
     pub deadline: Duration,
+    /// Shortest pause between attempts; the pause grows exponentially, with jitter.
     pub min_backoff: Duration,
+    /// Longest pause between attempts.
     pub max_backoff: Duration,
 }
 
@@ -105,6 +119,20 @@ impl Transport {
         }
     }
 
+    /// Sends `command` to the peer `dest` and waits for its reply, retrying until
+    /// [`RpcConfig::deadline`].
+    ///
+    /// Every attempt carries the same request id, so the peer executes the command at most
+    /// once and answers retries with the remembered reply. A late reply to any earlier attempt
+    /// completes the request. [`ErrorKind::Unavailable`](crate::app::ErrorKind::Unavailable)
+    /// replies are retried like timeouts.
+    ///
+    /// # Errors
+    ///
+    /// - [`TransportErr::Timeout`] if no reply came before the deadline.
+    /// - [`TransportErr::Remote`] if the peer replied with a non-retryable error.
+    /// - [`TransportErr::Cancelled`] if `token` was cancelled.
+    /// - [`TransportErr::ChanSend`] if the output task is gone.
     pub async fn forward(
         &self,
         token: &CancellationToken,
@@ -160,8 +188,17 @@ impl Transport {
     }
 
     /// Returns whether the command must be executed.
+    ///
+    /// Commands from clients and read-only commands from peers are always executed. A retry of
+    /// a peer write that already completed is answered with the remembered reply instead; a
+    /// retry of one still in progress, or of one the peer no longer waits for, is dropped.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportErr::ChanSend`] if replaying a remembered reply fails because the output task
+    /// is gone.
     pub async fn admit(&self, reply_ctx: &ReplyContext) -> Result<bool, TransportErr> {
-        let Some(request) = reply_ctx.request else {
+        let Some(request) = deduplicated(reply_ctx.request) else {
             return Ok(true);
         };
 
@@ -169,7 +206,7 @@ impl Transport {
             Admission::Execute => Ok(true),
             Admission::Replay(response) => {
                 tracing::debug!(origin = %reply_ctx.dest, seq = request.id.seq, "replaying reply to a retried request");
-                self.write(Outgoing::CommandReply {
+                self.write(Outgoing::ForwardReply {
                     msg_id: self.next_msg_id(),
                     // deep copy only if the cache still holds it, and outside the cache lock
                     response: Arc::unwrap_or_clone(response),
@@ -190,6 +227,12 @@ impl Transport {
         }
     }
 
+    /// Sends a successful reply. For a deduplicated peer request the reply is also remembered,
+    /// so a retry of the request is answered without executing it again.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportErr::ChanSend`] if the output task is gone.
     pub async fn reply(
         &self,
         response: CommandResponse,
@@ -201,21 +244,35 @@ impl Transport {
             request,
         } = reply_ctx;
 
-        if let Some(request) = request {
-            // copied outside the cache lock
-            self.replies
-                .complete(&dest, request.id, Arc::new(response.clone()));
-        }
-
-        self.write(Outgoing::CommandReply {
-            msg_id: self.next_msg_id(),
-            response,
-            in_reply_to,
-            dest,
-        })
-        .await
+        let msg_id = self.next_msg_id();
+        let outgoing = match request {
+            None => Outgoing::CommandReply {
+                msg_id,
+                response,
+                in_reply_to,
+                dest,
+            },
+            Some(request) => {
+                if request.deduplicate {
+                    self.replies
+                        .complete(&dest, request.id, Arc::new(response.clone()));
+                }
+                Outgoing::ForwardReply {
+                    msg_id,
+                    response,
+                    in_reply_to,
+                    dest,
+                }
+            }
+        };
+        self.write(outgoing).await
     }
 
+    /// Sends an error reply. A peer request is forgotten, so its retry is executed again.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportErr::ChanSend`] if the output task is gone.
     pub async fn reply_error(
         &self,
         error: CommandError,
@@ -227,7 +284,7 @@ impl Transport {
             request,
         } = reply_ctx;
 
-        if let Some(request) = request {
+        if let Some(request) = deduplicated(request) {
             self.replies.abandon(&dest, request.id);
         }
 
@@ -240,6 +297,7 @@ impl Transport {
         .await
     }
 
+    /// Hands a peer's reply to the request waiting for it; a reply nobody waits for is dropped.
     pub fn register_reply(&self, in_reply_to: u64, reply: Reply) {
         if let Err(TransportErr::NotAwaited) = self.pending.register(in_reply_to, reply) {
             tracing::debug!(msg_id = in_reply_to, "ignoring reply nobody waits for");
@@ -284,16 +342,21 @@ async fn wait_reply(
     }
 }
 
+fn deduplicated(request: Option<PeerRequest>) -> Option<PeerRequest> {
+    request.filter(|request| request.deduplicate)
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use tokio::sync::mpsc;
-    use tokio_util::sync::CancellationToken;
+    use tokio_util::{bytes::Bytes, sync::CancellationToken};
 
     use crate::{
         app::{
-            Command, CommandError, CommandResponse, ErrorKind, ReplyContext, SendCommand, SendRes,
+            Command, CommandError, CommandResponse, CommitOffsetsRes, ErrorKind, ReplyContext,
+            SendCommand, SendRes,
         },
         message::Outgoing,
         transport::{PeerRequest, RequestId},
@@ -314,7 +377,7 @@ mod tests {
     fn send_command() -> Command {
         Command::Send(SendCommand {
             key: "log".to_owned(),
-            msg: 7,
+            msg: Bytes::from_static(b"7"),
         })
     }
 
@@ -452,8 +515,17 @@ mod tests {
                     seq: 0,
                 },
                 watermark: 0,
+                deduplicate: true,
             }),
         }
+    }
+
+    fn read_only_peer_ctx(in_reply_to: u64) -> ReplyContext {
+        let mut ctx = peer_ctx(in_reply_to);
+        if let Some(request) = ctx.request.as_mut() {
+            request.deduplicate = false;
+        }
+        ctx
     }
 
     #[tokio::test]
@@ -468,7 +540,7 @@ mod tests {
             .expect("reply");
         assert!(matches!(
             write_rx.recv().await,
-            Some(Outgoing::CommandReply {
+            Some(Outgoing::ForwardReply {
                 in_reply_to: 10,
                 ..
             })
@@ -478,11 +550,54 @@ mod tests {
         assert!(!transport.admit(&peer_ctx(11)).await.expect("admit"));
         assert!(matches!(
             write_rx.recv().await,
-            Some(Outgoing::CommandReply {
+            Some(Outgoing::ForwardReply {
                 in_reply_to: 11,
                 response: CommandResponse::Send(SendRes { offset: 3 }),
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn retry_of_read_only_peer_request_is_executed_again() {
+        let (write_tx, mut write_rx) = mpsc::channel(4);
+        let transport = Transport::new(write_tx, config(), 1);
+
+        assert!(
+            transport
+                .admit(&read_only_peer_ctx(10))
+                .await
+                .expect("admit")
+        );
+        // a retry while the first attempt is still running is executed too
+        assert!(
+            transport
+                .admit(&read_only_peer_ctx(11))
+                .await
+                .expect("admit")
+        );
+        transport
+            .reply(
+                CommandResponse::CommitOffsets(CommitOffsetsRes),
+                read_only_peer_ctx(10),
+            )
+            .await
+            .expect("reply");
+        assert!(matches!(
+            write_rx.recv().await,
+            Some(Outgoing::ForwardReply {
+                in_reply_to: 10,
+                ..
+            })
+        ));
+
+        // nothing was remembered: a later retry is executed again, nothing is replayed
+        assert!(
+            transport
+                .admit(&read_only_peer_ctx(12))
+                .await
+                .expect("admit")
+        );
+        assert!(write_rx.try_recv().is_err());
     }
 }

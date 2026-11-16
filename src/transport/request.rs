@@ -19,6 +19,9 @@ pub struct PeerRequest {
     pub id: RequestId,
     /// Lowest `seq` the sender still waits for.
     pub watermark: u64,
+    /// Off for read-only commands: re-executing a retry is harmless, and their replies (poll
+    /// results) are too big to remember.
+    pub deduplicate: bool,
 }
 
 pub fn new_incarnation() -> u64 {

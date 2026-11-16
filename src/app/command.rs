@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use tokio_util::bytes::Bytes;
+
 use crate::transport::PeerRequest;
 
 #[derive(Debug, Clone)]
@@ -29,10 +31,16 @@ pub enum Command {
     ListCommittedOffsets(ListCommittedOffsetsCommand),
 }
 
+impl Command {
+    pub fn is_read_only(&self) -> bool {
+        matches!(self, Command::Poll(_) | Command::ListCommittedOffsets(_))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SendCommand {
     pub key: String,
-    pub msg: u32,
+    pub msg: Bytes,
 }
 
 #[derive(Debug, Clone)]

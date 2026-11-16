@@ -85,7 +85,7 @@ impl ReplyCache {
 
 impl OriginState {
     fn admit(&mut self, request: PeerRequest) -> Admission {
-        let PeerRequest { id, watermark } = request;
+        let PeerRequest { id, watermark, .. } = request;
 
         match id.incarnation.cmp(&self.incarnation) {
             Ordering::Less => return Admission::Stale,
@@ -132,6 +132,7 @@ mod tests {
         PeerRequest {
             id: RequestId { incarnation, seq },
             watermark,
+            deduplicate: true,
         }
     }
 

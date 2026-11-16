@@ -30,6 +30,11 @@ impl PendingTable {
         }
     }
 
+    /// Delivers `reply` to the request that sent `msg_id`.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportErr::NotAwaited`] if no request waits for `msg_id` any more.
     pub fn register(&self, msg_id: u64, reply: Reply) -> Result<(), TransportErr> {
         let Some(reply_tx) = self.lock().remove(&msg_id) else {
             return Err(TransportErr::NotAwaited);

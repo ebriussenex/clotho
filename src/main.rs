@@ -1,3 +1,5 @@
+#![deny(rustdoc::broken_intra_doc_links)]
+
 use crate::{io::stdio::StdioReader, io::stdio::StdioWriter, node::Config};
 
 use tokio::{self};
@@ -8,6 +10,7 @@ mod logs;
 mod maelstrom;
 mod message;
 mod node;
+mod offsets;
 mod transport;
 
 fn init_tracing() {
