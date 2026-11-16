@@ -1,98 +1,88 @@
 use crate::{
-    app::{App, AppErr, ClientRequest},
+    app::{App, AppCommand, AppErr, CommandError, ErrorKind, Ownership, ReplyContext},
     io::{IoError, MessageReader, MessageWriter},
-    kv::KvEvent,
+    logs::{Store, StoreConfig},
+    maelstrom::protocol::wire::{Msg, Payload},
     message::{self, DropReason, Incoming},
-    offsets::store::CommitedOffsets,
-    replication::{Replication, ReplicationErr, ReplicationRequest},
-    retry::RetryPolicy,
-    storage::Logs,
-    transport::{Transport, TransportErr},
+    offsets::CommittedOffsets,
+    transport::{self, RpcConfig, Transport, TransportErr},
 };
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use thiserror::Error;
 use tokio::{
-    sync::mpsc::{self},
+    sync::mpsc::{self, error::TrySendError},
     task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
 
+/// Error that stopped the node.
 #[derive(Debug, Error)]
 pub enum NodeErr {
+    /// One of the node's tasks failed.
     #[error(transparent)]
     Handle(#[from] HandleErr),
-    #[error(transparent)]
-    Msg(#[from] MsgErr),
 }
 
-#[derive(Debug, Error)]
-pub enum MsgErr {
-    #[error("missing field in incoming message: {0}")]
-    MissingField(&'static str),
-}
-
+/// Failure of one of the node's tasks (reader, writer, app). Stops the whole node.
 #[derive(Debug, Error)]
 pub enum HandleErr {
-    #[error("failed to send {item} to {channel} channel")]
-    ChanSend {
-        channel: &'static str,
-        item: &'static str,
-    },
+    /// The app stopped taking commands.
+    #[error("failed to send to {channel} channel")]
+    ChanSend { channel: &'static str },
+    /// The app failed.
     #[error(transparent)]
     App(#[from] AppErr),
-    #[error(transparent)]
-    Replication(#[from] ReplicationErr),
+    /// A reply couldn't be sent: the output task is gone.
     #[error(transparent)]
     Transport(#[from] TransportErr),
-    #[error(transparent)]
-    Msg(#[from] MsgErr),
+    /// Reading or writing the stream failed. Malformed messages are not errors, they are
+    /// answered with a protocol error and skipped.
     #[error(transparent)]
     Io(#[from] IoError),
 }
 
 impl HandleErr {
-    fn chan_send(channel: &'static str, item: &'static str) -> Self {
-        tracing::error!(channel, item, "channel send failed");
-        Self::ChanSend { channel, item }
+    fn chan_send<T>(channel: &'static str) -> Self {
+        tracing::error!(
+            channel,
+            payload_type = std::any::type_name::<T>(),
+            "channel send failed"
+        );
+        Self::ChanSend { channel }
     }
 }
 
 pub struct Config {
     poll_max_msgs_size: usize,
-    request_timeout: Duration,
-    transport_retry: RetryPolicy,
-    cas_retry: RetryPolicy,
-    replication_delta_interval: Duration,
-    replication_digest_interval: Duration,
+    rpc: RpcConfig,
+    max_in_flight_commands: usize,
+    command_queue_capacity: usize,
+    ownership_seed: u64,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
             poll_max_msgs_size: 100,
-            request_timeout: Duration::from_millis(1000),
-            transport_retry: RetryPolicy {
-                max_times: 3,
-                min_delay: Duration::from_millis(25),
-                max_delay: Duration::from_millis(250),
-            },
-            cas_retry: RetryPolicy {
-                max_times: 8,
-                min_delay: Duration::from_millis(5),
-                max_delay: Duration::from_millis(100),
-            },
-            replication_delta_interval: Duration::from_millis(1000),
-            replication_digest_interval: Duration::from_millis(1000),
+            rpc: RpcConfig::default(),
+            max_in_flight_commands: 64,
+            command_queue_capacity: 32,
+            ownership_seed: 0,
         }
     }
 }
 
+/// Runs the node until the input ends, a task fails, or Ctrl-C.
+///
+/// # Errors
+///
+/// The first [`HandleErr`] of the reader, writer, or app task. The other tasks are aborted.
 pub async fn run<R, W>(
     config: Config,
-    node_id: String,
-    node_ids: Vec<String>,
+    node_id: &str,
+    peer_ids: &[String],
     reader: R,
     writer: W,
 ) -> Result<(), NodeErr>
@@ -101,97 +91,54 @@ where
     W: MessageWriter,
 {
     let (write_tx, write_rx) = mpsc::channel(32);
-    let (client_tx, client_rx) = mpsc::channel(32);
-    let (kv_tx, kv_rx) = mpsc::channel(32);
-    let (replication_tx, replication_rx) = mpsc::channel(32);
+    let (command_tx, command_rx) = mpsc::channel(config.command_queue_capacity.max(1));
 
     let mut join_set = JoinSet::new();
     let token = CancellationToken::new();
-    let transport = Transport::new(write_tx, config.request_timeout, config.transport_retry);
-    let logs = Logs::new();
-    let commited_offsets = CommitedOffsets::new();
-    let node_id: Arc<str> = node_id.into();
-    let node_ids = Arc::new(node_ids);
-    let replication = Replication::new(logs.clone(), transport.clone(), node_ids.clone());
+    let transport = Transport::new(write_tx, config.rpc, transport::new_incarnation());
+    let logs = Store::new(StoreConfig::default(), token.child_token());
+    let committed_offsets = CommittedOffsets::new();
+    let ownership = Ownership::new(
+        node_id.to_owned(),
+        peer_ids.iter().cloned(),
+        config.ownership_seed,
+    );
+
+    let node_id: Arc<str> = Arc::from(node_id);
 
     join_set.spawn({
         let token = token.clone();
-        async move { receive_and_dispatch(token, client_tx, kv_tx, replication_tx, reader).await }
+        let transport = transport.clone();
+        async move { receive_and_dispatch(token, command_tx, transport, reader).await }
     });
 
     join_set.spawn({
         let token = token.clone();
-        let node_id = node_id.clone();
-        async move { write(token, writer, write_rx, node_id).await }
+        async move { write(token, writer, write_rx, node_id.as_ref()).await }
     });
 
     join_set.spawn({
         let token = token.clone();
         let transport = transport.clone();
-        let logs = logs.clone();
-        let commited_offsets = commited_offsets.clone();
 
         async move {
             App::new(
                 logs,
                 transport,
-                commited_offsets,
+                committed_offsets,
+                ownership,
                 config.poll_max_msgs_size,
-                config.cas_retry,
+                config.max_in_flight_commands,
             )
-            .run(token, client_rx)
+            .run(token, command_rx)
             .await
             .map_err(HandleErr::from)
         }
     });
 
-    join_set.spawn({
-        let token = token.clone();
-        let transport = transport.clone();
-
-        async move { process_kv_events(token, kv_rx, transport).await }
-    });
-
-    join_set.spawn({
-        let token = token.clone();
-        let replication = replication.clone();
-
-        async move {
-            replication
-                .run_inbound(token, replication_rx)
-                .await
-                .map_err(HandleErr::from)
-        }
-    });
-
-    join_set.spawn({
-        let replication = replication.clone();
-        let token = token.clone();
-        async move {
-            replication
-                .run_delta_sender(token, config.replication_delta_interval)
-                .await
-                .map_err(HandleErr::from)
-        }
-    });
-
-    join_set.spawn({
-        let replication = replication.clone();
-        let token = token.clone();
-        let node_id = node_id.clone();
-
-        async move {
-            replication
-                .run_digest_announcer(token, config.replication_digest_interval, node_id)
-                .await
-                .map_err(HandleErr::from)
-        }
-    });
-
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            token.cancel();
-        }
+        biased;
+
         result = async {
             while let Some(res) = join_set.join_next().await {
                 if let Ok(Err(e)) = res {
@@ -201,6 +148,9 @@ where
             Ok(())
         } => {
             result?;
+        }
+        _ = tokio::signal::ctrl_c() => {
+            token.cancel();
         }
     }
 
@@ -212,61 +162,82 @@ where
 
 async fn receive_and_dispatch(
     token: CancellationToken,
-    client_tx: mpsc::Sender<ClientRequest>,
-    kv_tx: mpsc::Sender<KvEvent>,
-    replication_tx: mpsc::Sender<ReplicationRequest>,
+    command_tx: mpsc::Sender<AppCommand>,
+    transport: Transport,
     mut reader: impl MessageReader,
 ) -> Result<(), HandleErr> {
     loop {
         let msg = tokio::select! {
+            biased;
+
             _ = token.cancelled() => return Ok(()),
-            msg = reader.next() => msg,
+            msg = reader.next::<Payload>() => msg,
         };
 
-        match msg? {
-            Some(msg) => match msg.classify() {
-                Ok(msg) => match msg {
-                    Incoming::ClientRequest(client_request) => client_tx
-                        .send(client_request)
-                        .await
-                        .map_err(|_| HandleErr::chan_send("client_tx", "client request"))?,
-                    Incoming::KvEvent(kv_event) => kv_tx
-                        .send(kv_event)
-                        .await
-                        .map_err(|_| HandleErr::chan_send("kv_tx", "kv event"))?,
-                    Incoming::ReplicationRequest(replication_req) => {
-                        replication_tx.send(replication_req).await.map_err(|_| {
-                            HandleErr::chan_send("replication_tx", "replication request")
-                        })?
-                    }
-                },
-                Err(reason) => match reason {
-                    DropReason::NoMsgId => Err(HandleErr::Msg(MsgErr::MissingField("msg_id")))?,
-                    DropReason::NoInReplyTo => {
-                        Err(HandleErr::Msg(MsgErr::MissingField("in_reply_to")))?
-                    }
-                    DropReason::Ignored => (),
-                },
-            },
-            None => return Ok(()),
+        match msg {
+            Ok(Some(msg)) => dispatch(msg, &command_tx, &transport).await?,
+            Ok(None) => return Ok(()),
+            Err(IoError::Malformed {
+                src,
+                msg_id,
+                source,
+            }) => {
+                tracing::warn!(?src, ?msg_id, error = %source, "malformed message");
+                if let (Some(dest), Some(in_reply_to)) = (src, msg_id) {
+                    let reply_ctx = ReplyContext {
+                        dest,
+                        in_reply_to,
+                        request: None,
+                    };
+                    let error = CommandError::new(ErrorKind::Protocol, source.to_string());
+                    transport.reply_error(error, reply_ctx).await?;
+                }
+            }
+            Err(e) => return Err(e.into()),
         }
     }
 }
 
-async fn process_kv_events(
-    token: CancellationToken,
-    mut kv_rx: mpsc::Receiver<KvEvent>,
-    transport: Transport,
+async fn dispatch(
+    msg: Msg<Payload>,
+    command_tx: &mpsc::Sender<AppCommand>,
+    transport: &Transport,
 ) -> Result<(), HandleErr> {
-    loop {
-        let event = tokio::select! {
-            _ = token.cancelled() => return Ok(()),
-            event = kv_rx.recv() => event,
-        };
+    let src = msg.src.clone();
+    match msg.classify() {
+        Ok(Incoming::AppCommand(command)) => {
+            if !transport.admit(&command.reply_ctx).await? {
+                return Ok(());
+            }
 
-        match event {
-            Some(event) => transport.register_kv_event(event).await?,
-            None => return Ok(()),
+            match command_tx.try_send(command) {
+                Ok(()) => Ok(()),
+                Err(TrySendError::Full(command)) => {
+                    tracing::warn!(src = %command.reply_ctx.dest, "command queue is full, rejecting command");
+                    let error = CommandError::new(ErrorKind::Unavailable, "node is overloaded");
+                    Ok(transport.reply_error(error, command.reply_ctx).await?)
+                }
+                Err(TrySendError::Closed(_)) => {
+                    Err(HandleErr::chan_send::<AppCommand>("command_tx"))
+                }
+            }
+        }
+        Ok(Incoming::CommandReply(reply)) => {
+            tracing::debug!(src = %reply.src, in_reply_to = reply.in_reply_to, "received command reply");
+            transport.register_reply(reply.in_reply_to, reply.result);
+            Ok(())
+        }
+        Err(DropReason::NoMsgId) => {
+            tracing::warn!(%src, "dropping command without msg_id");
+            Ok(())
+        }
+        Err(DropReason::NoInReplyTo) => {
+            tracing::warn!(%src, "dropping reply without in_reply_to");
+            Ok(())
+        }
+        Err(DropReason::ClientReply) => {
+            tracing::warn!(%src, "dropping client-protocol reply, the node sends no client requests");
+            Ok(())
         }
     }
 }
@@ -275,17 +246,158 @@ async fn write(
     token: CancellationToken,
     mut writer: impl MessageWriter,
     mut write_rx: mpsc::Receiver<message::Outgoing>,
-    node_id: Arc<str>,
+    node_id: &str,
 ) -> Result<(), HandleErr> {
     loop {
         let msg = tokio::select! {
+            biased;
+
             _ = token.cancelled() => return Ok(()),
             msg = write_rx.recv() => msg,
         };
 
         match msg {
-            Some(msg) => writer.send(msg.into_msg(&node_id)).await?,
+            Some(msg) => writer.send(msg.into_msg(node_id.as_ref())).await?,
             None => return Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::mpsc;
+    use tokio_util::bytes::Bytes;
+
+    use crate::{
+        app::{CommandError, ErrorKind},
+        maelstrom::protocol::{
+            value::{Base64Bytes, JsonValue},
+            wire::{Body, ForwardedPayload, Msg, Payload, RequestId},
+        },
+        message::Outgoing,
+        transport::{RpcConfig, Transport},
+    };
+
+    use super::dispatch;
+
+    fn msg(src: &str, msg_id: Option<u64>, payload: Payload) -> Msg<Payload> {
+        Msg {
+            src: src.to_owned(),
+            dest: "n1".to_owned(),
+            body: Body {
+                id: msg_id,
+                in_reply_to: None,
+                payload,
+            },
+        }
+    }
+
+    fn client_send(msg_id: u64) -> Msg<Payload> {
+        msg(
+            "c1",
+            Some(msg_id),
+            Payload::Send {
+                key: "k".to_owned(),
+                msg: JsonValue(Bytes::from_static(b"7")),
+            },
+        )
+    }
+
+    fn peer_send(msg_id: u64, seq: u64) -> Msg<Payload> {
+        msg(
+            "n2",
+            Some(msg_id),
+            Payload::Fwd {
+                request_id: RequestId {
+                    incarnation: 1,
+                    seq,
+                },
+                watermark: seq,
+                payload: ForwardedPayload::Send {
+                    key: "k".to_owned(),
+                    msg: Base64Bytes(Bytes::from_static(b"7")),
+                },
+            },
+        )
+    }
+
+    fn transport() -> (Transport, mpsc::Receiver<Outgoing>) {
+        let (write_tx, write_rx) = mpsc::channel(8);
+        (Transport::new(write_tx, RpcConfig::default(), 1), write_rx)
+    }
+
+    #[tokio::test]
+    async fn full_queue_rejects_command_with_unavailable() {
+        let (transport, mut write_rx) = transport();
+        let (command_tx, _command_rx) = mpsc::channel(1);
+
+        dispatch(client_send(1), &command_tx, &transport)
+            .await
+            .expect("first command is queued");
+        dispatch(client_send(2), &command_tx, &transport)
+            .await
+            .expect("overload is not a node failure");
+
+        assert!(matches!(
+            write_rx.try_recv(),
+            Ok(Outgoing::ErrorReply {
+                in_reply_to: 2,
+                error: CommandError {
+                    kind: ErrorKind::Unavailable,
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejected_peer_request_executes_on_retry() {
+        let (transport, mut write_rx) = transport();
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+
+        dispatch(client_send(1), &command_tx, &transport)
+            .await
+            .expect("fills the queue");
+        dispatch(peer_send(10, 0), &command_tx, &transport)
+            .await
+            .expect("rejected");
+        assert!(matches!(
+            write_rx.try_recv(),
+            Ok(Outgoing::ErrorReply {
+                in_reply_to: 10,
+                ..
+            })
+        ));
+
+        command_rx.recv().await.expect("frees the queue");
+
+        // the retry must not be treated as "in progress": the rejected attempt was not applied
+        dispatch(peer_send(11, 0), &command_tx, &transport)
+            .await
+            .expect("queued");
+        let command = command_rx.try_recv().expect("retry reaches the app");
+        assert_eq!(command.reply_ctx.in_reply_to, 11);
+    }
+
+    #[tokio::test]
+    async fn command_without_msg_id_is_dropped() {
+        let (transport, mut write_rx) = transport();
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+
+        let no_id = msg(
+            "c1",
+            None,
+            Payload::Send {
+                key: "k".to_owned(),
+                msg: JsonValue(Bytes::from_static(b"7")),
+            },
+        );
+        dispatch(no_id, &command_tx, &transport)
+            .await
+            .expect("not a node failure");
+
+        assert!(command_rx.try_recv().is_err());
+        assert!(write_rx.try_recv().is_err());
     }
 }
