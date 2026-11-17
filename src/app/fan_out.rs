@@ -44,9 +44,8 @@ impl<Q: Request> FanOut<Q> {
     ///
     /// # Errors
     ///
-    /// The first error that stops the handler: [`AppErr::Transport`] with
-    /// [`TransportErr::Cancelled`] when the node is stopping, other [`AppErr`]s when the node is
-    /// broken, [`AppErr::Handler`] if a forward task panicked.
+    /// The first [`AppErr`] that means the node is broken: [`AppErr::Transport`] from
+    /// [`owner_reply`], or [`AppErr::Handler`] if a forward task ended abnormally.
     pub async fn join(mut self) -> Result<Vec<Result<Q::Response, CommandError>>, AppErr> {
         let mut parts = Vec::with_capacity(self.tasks.len());
         while let Some(joined) = self.tasks.join_next().await {
@@ -61,13 +60,14 @@ impl<Q: Request> FanOut<Q> {
 /// client.
 ///
 /// - [`TransportErr::Timeout`] becomes [`ErrorKind::Timeout`].
+/// - [`TransportErr::Cancelled`] becomes [`ErrorKind::Timeout`] too: the node is stopping, and
+///   the owner may have executed the command already.
 /// - [`TransportErr::Remote`] is passed on as is.
 /// - [`TransportErr::UnexpectedResponse`] becomes [`ErrorKind::Internal`].
 ///
 /// # Errors
 ///
-/// [`AppErr::Transport`] for the other transport errors: [`TransportErr::Cancelled`] when the
-/// node is stopping, the rest when it is broken.
+/// [`AppErr::Transport`] for the other transport errors: the node is broken.
 pub fn owner_reply<R>(
     owner: &str,
     result: Result<R, TransportErr>,
@@ -77,6 +77,10 @@ pub fn owner_reply<R>(
         Err(TransportErr::Timeout(_)) => Ok(Err(CommandError::new(
             ErrorKind::Timeout,
             format!("owner {owner} did not reply in time"),
+        ))),
+        Err(TransportErr::Cancelled) => Ok(Err(CommandError::new(
+            ErrorKind::Timeout,
+            format!("node is shutting down, owner {owner} may have executed the command"),
         ))),
         Err(TransportErr::Remote(error)) => {
             tracing::warn!(owner, ?error, "owner replied with an error");
@@ -142,11 +146,14 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_forward_stops_the_handler() {
+    fn cancelled_forward_is_indefinite_for_client() {
         let result = reply(Err(TransportErr::Cancelled));
         assert!(matches!(
             result,
-            Err(AppErr::Transport(TransportErr::Cancelled))
+            Ok(Err(CommandError {
+                kind: ErrorKind::Timeout,
+                ..
+            }))
         ));
     }
 

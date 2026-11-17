@@ -36,7 +36,8 @@ pub enum TransportErr {
     /// The reply channel closed. Cannot happen while [`Transport::forward`] holds its sender.
     #[error("response sender dropped: {0}")]
     SenderDropped(&'static str),
-    /// The node is stopping; nobody is to be answered.
+    /// The node is stopping and the request was abandoned; the peer may or may not have executed
+    /// it.
     #[error("transport cancelled")]
     Cancelled,
     /// The output task is gone, so the node can't send anything. Fatal.

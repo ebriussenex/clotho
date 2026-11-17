@@ -30,7 +30,7 @@ pub enum AppErr {
     /// The log storage failed other than by shutting down.
     #[error(transparent)]
     Storage(#[from] StorageErr),
-    /// Internode transport failed; [`TransportErr::Cancelled`] only means the node is stopping.
+    /// Replying or forwarding failed so that the node can't go on, e.g. the output task is gone.
     #[error(transparent)]
     Transport(#[from] TransportErr),
     /// A command handler or forward task panicked.
@@ -163,7 +163,6 @@ impl App {
         match reply {
             Ok(Ok(response)) => Ok(self.transport.reply(response, reply_ctx).await?),
             Ok(Err(error)) => Ok(self.transport.reply_error(error, reply_ctx).await?),
-            Err(AppErr::Transport(TransportErr::Cancelled)) => Ok(()),
             Err(e) => Err(e),
         }
     }
