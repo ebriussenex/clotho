@@ -72,11 +72,6 @@ impl Default for Config {
     }
 }
 
-/// Runs the node until the input ends, a task fails, or SIGINT / SIGTERM arrives, then stops it
-/// gracefully: [`receive_and_dispatch`] stops reading, [`App::run`] answers or rejects the
-/// commands it holds, [`write`](fn@write) writes all replies. Tasks still running after
-/// [`Config::shutdown_grace`] are aborted.
-///
 /// # Errors
 ///
 /// - [`NodeErr::Signal`] if SIGINT or SIGTERM can't be listened to; the node doesn't start.
