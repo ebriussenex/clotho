@@ -85,7 +85,12 @@ impl From<CommandResponse> for ForwardedResponse {
         match res {
             CommandResponse::Send(SendRes { offset }) => ForwardedResponse::SendOk { offset },
             CommandResponse::Poll(PollRes { msgs }) => ForwardedResponse::PollOk {
-                msgs: super::map_msgs(msgs, Base64Bytes),
+                msgs: msgs
+                    .into_iter()
+                    .map(|(key, (from, msgs))| {
+                        (key, (from, msgs.into_iter().map(Base64Bytes).collect()))
+                    })
+                    .collect(),
             },
             CommandResponse::CommitOffsets(_) => ForwardedResponse::CommitOffsetsOk,
             CommandResponse::ListCommittedOffsets(ListCommittedOffsetsRes { offsets }) => {

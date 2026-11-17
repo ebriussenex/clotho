@@ -90,7 +90,12 @@ impl From<ForwardedResponse> for CommandResponse {
         match response {
             ForwardedResponse::SendOk { offset } => CommandResponse::Send(SendRes { offset }),
             ForwardedResponse::PollOk { msgs } => CommandResponse::Poll(PollRes {
-                msgs: super::map_msgs(msgs, |msg| msg.0),
+                msgs: msgs
+                    .into_iter()
+                    .map(|(key, (from, msgs))| {
+                        (key, (from, msgs.into_iter().map(|msg| msg.0).collect()))
+                    })
+                    .collect(),
             }),
             ForwardedResponse::CommitOffsetsOk => CommandResponse::CommitOffsets(CommitOffsetsRes),
             ForwardedResponse::ListCommittedOffsetsOk { offsets } => {
