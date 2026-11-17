@@ -5,7 +5,7 @@ use crate::{
     maelstrom::protocol::wire::{Msg, Payload},
     message::{self, DropReason, Incoming},
     offsets::CommittedOffsets,
-    transport::{self, RpcConfig, Transport, TransportErr},
+    transport::{self, Delivery, RpcConfig, Transport, TransportErr},
 };
 
 use std::{sync::Arc, time::Duration};
@@ -219,7 +219,7 @@ async fn dispatch(
     let src = msg.src.clone();
     match msg.classify() {
         Ok(Incoming::AppCommand(command)) => {
-            if !transport.admit(&command.reply_ctx).await? {
+            if transport.deduplicate(&command.reply_ctx).await? == Delivery::Duplicate {
                 return Ok(());
             }
 

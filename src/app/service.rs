@@ -19,7 +19,7 @@ use crate::{
     transport::{Transport, TransportErr},
 };
 
-use super::command::{AppCommand, Command, CommandSource, PollCommand, ReplyContext, SendCommand};
+use super::command::{AppCommand, Command, CommandSource, PollCommand, SendCommand};
 use super::response::{
     CommandResponse, CommitOffsetsRes, ListCommittedOffsetsRes, PollRes, SendRes,
 };
@@ -141,22 +141,30 @@ impl App {
             source,
         } = command;
 
-        let result = match kind {
-            Command::Send(command) => self.handle_send(token, source, reply_ctx, command).await,
-            Command::Poll(command) => self.handle_poll(token, source, reply_ctx, command).await,
-            Command::CommitOffsets(command) => {
-                self.handle_commit_offsets(token, source, reply_ctx, command)
-                    .await
-            }
-            Command::ListCommittedOffsets(command) => {
-                self.handle_list_committed_offsets(token, source, reply_ctx, command)
-                    .await
-            }
+        let reply = match kind {
+            Command::Send(command) => self
+                .handle_send(token, source, command)
+                .await
+                .map(|reply| reply.map(CommandResponse::from)),
+            Command::Poll(command) => self
+                .handle_poll(token, source, command)
+                .await
+                .map(|reply| reply.map(CommandResponse::from)),
+            Command::CommitOffsets(command) => self
+                .handle_commit_offsets(token, source, command)
+                .await
+                .map(|reply| reply.map(CommandResponse::from)),
+            Command::ListCommittedOffsets(command) => self
+                .handle_list_committed_offsets(token, source, command)
+                .await
+                .map(|reply| reply.map(CommandResponse::from)),
         };
 
-        match result {
+        match reply {
+            Ok(Ok(response)) => Ok(self.transport.reply(response, reply_ctx).await?),
+            Ok(Err(error)) => Ok(self.transport.reply_error(error, reply_ctx).await?),
             Err(AppErr::Transport(TransportErr::Cancelled)) => Ok(()),
-            result => result,
+            Err(e) => Err(e),
         }
     }
 
@@ -164,39 +172,20 @@ impl App {
         &self,
         token: &CancellationToken,
         source: CommandSource,
-        reply_ctx: ReplyContext,
         command: SendCommand,
-    ) -> Result<(), AppErr> {
+    ) -> Result<Reply<SendRes>, AppErr> {
         if source == CommandSource::Client && !self.ownership.is_local(&command.key) {
             let owner = self.ownership.owner(&command.key);
-            let result = self
-                .transport
-                .forward(token, owner, Command::Send(command))
-                .await;
-            return match result {
-                Ok(response @ CommandResponse::Send(_)) => {
-                    Ok(self.transport.reply(response, reply_ctx).await?)
-                }
-                Ok(response) => {
-                    let error = fan_out::unexpected_response(owner, &response);
-                    Ok(self.transport.reply_error(error, reply_ctx).await?)
-                }
-                Err(e) => match fan_out::forward_failure(owner, e)? {
-                    Some(error) => Ok(self.transport.reply_error(error, reply_ctx).await?),
-                    None => Ok(()),
-                },
-            };
+            let result = self.transport.forward(token, owner, command).await;
+            return fan_out::owner_reply(owner, result);
         }
 
         match self.logs.append(&command.key, command.msg).await {
-            Ok(offset) => {
-                let response = CommandResponse::Send(SendRes { offset });
-                Ok(self.transport.reply(response, reply_ctx).await?)
-            }
-            Err(StorageErr::ShuttingDown) => {
-                let error = CommandError::new(ErrorKind::Unavailable, "node is shutting down");
-                Ok(self.transport.reply_error(error, reply_ctx).await?)
-            }
+            Ok(offset) => Ok(Ok(SendRes { offset })),
+            Err(StorageErr::ShuttingDown) => Ok(Err(CommandError::new(
+                ErrorKind::Unavailable,
+                "node is shutting down",
+            ))),
             Err(e) => Err(e.into()),
         }
     }
@@ -205,31 +194,28 @@ impl App {
         &self,
         token: &CancellationToken,
         source: CommandSource,
-        reply_ctx: ReplyContext,
         command: PollCommand,
-    ) -> Result<(), AppErr> {
+    ) -> Result<Reply<PollRes>, AppErr> {
         match source {
             CommandSource::Peer => {
                 let msgs = self.logs.poll(command.offsets, self.poll_max_msgs_size);
-                let response = CommandResponse::Poll(PollRes { msgs });
-                Ok(self.transport.reply(response, reply_ctx).await?)
+                Ok(Ok(PollRes { msgs }))
             }
             CommandSource::Client => {
                 let parts: Partitioned<HashMap<_, _>> = self
                     .ownership
                     .partition(command.offsets, |(key, _)| key.as_str());
-                let peer_poll = |offsets| Command::Poll(PollCommand { offsets });
+                let peer_poll = |offsets| PollCommand { offsets };
 
                 let remote = FanOut::scatter(&self.transport, token, parts.remote, peer_poll);
                 let mut msgs = self.logs.poll(parts.local, self.poll_max_msgs_size);
 
-                let remote_parts = remote.join::<PollRes>().await?;
+                let remote_parts = remote.join().await?;
                 for part in remote_parts.into_iter().filter_map(Result::ok) {
                     msgs.extend(part.msgs);
                 }
 
-                let response = CommandResponse::Poll(PollRes { msgs });
-                Ok(self.transport.reply(response, reply_ctx).await?)
+                Ok(Ok(PollRes { msgs }))
             }
         }
     }
@@ -238,38 +224,30 @@ impl App {
         &self,
         token: &CancellationToken,
         source: CommandSource,
-        reply_ctx: ReplyContext,
         command: ListCommittedOffsetsCommand,
-    ) -> Result<(), AppErr> {
+    ) -> Result<Reply<ListCommittedOffsetsRes>, AppErr> {
         match source {
             CommandSource::Peer => {
                 let offsets = self.committed_offsets.list(command.keys);
-                let response =
-                    CommandResponse::ListCommittedOffsets(ListCommittedOffsetsRes { offsets });
-                Ok(self.transport.reply(response, reply_ctx).await?)
+                Ok(Ok(ListCommittedOffsetsRes { offsets }))
             }
             CommandSource::Client => {
                 let parts: Partitioned<Vec<_>> =
                     self.ownership.partition(command.keys, String::as_str);
-                let peer_list =
-                    |keys| Command::ListCommittedOffsets(ListCommittedOffsetsCommand { keys });
+                let peer_list = |keys| ListCommittedOffsetsCommand { keys };
 
                 let remote = FanOut::scatter(&self.transport, token, parts.remote, peer_list);
                 let mut offsets = self.committed_offsets.list(parts.local);
 
-                let remote_parts = remote.join::<ListCommittedOffsetsRes>().await?;
+                let remote_parts = remote.join().await?;
                 for part in remote_parts {
                     match part {
                         Ok(part) => offsets.extend(part.offsets),
-                        Err(error) => {
-                            return Ok(self.transport.reply_error(error, reply_ctx).await?);
-                        }
+                        Err(error) => return Ok(Err(error)),
                     }
                 }
 
-                let response =
-                    CommandResponse::ListCommittedOffsets(ListCommittedOffsetsRes { offsets });
-                Ok(self.transport.reply(response, reply_ctx).await?)
+                Ok(Ok(ListCommittedOffsetsRes { offsets }))
             }
         }
     }
@@ -278,21 +256,18 @@ impl App {
         &self,
         token: &CancellationToken,
         source: CommandSource,
-        reply_ctx: ReplyContext,
         command: CommitOffsetsCommand,
-    ) -> Result<(), AppErr> {
+    ) -> Result<Reply<CommitOffsetsRes>, AppErr> {
         match source {
             CommandSource::Peer => {
                 self.committed_offsets.commit(command.offsets);
-                let response = CommandResponse::CommitOffsets(CommitOffsetsRes);
-                Ok(self.transport.reply(response, reply_ctx).await?)
+                Ok(Ok(CommitOffsetsRes))
             }
             CommandSource::Client => {
                 let parts: Partitioned<HashMap<_, _>> = self
                     .ownership
                     .partition(command.offsets, |(key, _)| key.as_str());
-                let peer_commit =
-                    |offsets| Command::CommitOffsets(CommitOffsetsCommand { offsets });
+                let peer_commit = |offsets| CommitOffsetsCommand { offsets };
 
                 let remote = FanOut::scatter(&self.transport, token, parts.remote, peer_commit);
                 let applied_locally = !parts.local.is_empty();
@@ -302,7 +277,7 @@ impl App {
 
                 let mut applied_somewhere = applied_locally;
                 let mut failures = Vec::new();
-                for part in remote.join::<CommitOffsetsRes>().await? {
+                for part in remote.join().await? {
                     match part {
                         Ok(CommitOffsetsRes) => applied_somewhere = true,
                         Err(error) => failures.push(error),
@@ -310,19 +285,18 @@ impl App {
                 }
 
                 match commit_error(failures, applied_somewhere) {
-                    None => {
-                        let response = CommandResponse::CommitOffsets(CommitOffsetsRes);
-                        Ok(self.transport.reply(response, reply_ctx).await?)
-                    }
+                    None => Ok(Ok(CommitOffsetsRes)),
                     Some(error) => {
-                        tracing::warn!(?error, dest = %reply_ctx.dest, "commit failed on some owners");
-                        Ok(self.transport.reply_error(error, reply_ctx).await?)
+                        tracing::warn!(?error, "commit failed on some owners");
+                        Ok(Err(error))
                     }
                 }
             }
         }
     }
 }
+
+type Reply<R> = Result<R, CommandError>;
 
 /// A commit split between owners is not atomic. A definite failure ("not applied") is reported
 /// only if nothing was applied anywhere; otherwise the outcome of the commit is unknown.
@@ -348,7 +322,7 @@ mod tests {
     use tokio_util::bytes::Bytes;
 
     use crate::{
-        app::{AppCommand, ListCommittedOffsetsRes},
+        app::{AppCommand, ListCommittedOffsetsRes, ReplyContext},
         logs::StoreConfig,
         message::Outgoing,
         transport::{PeerRequest, RequestId, RpcConfig},
