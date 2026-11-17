@@ -12,7 +12,7 @@ use tokio::{sync::mpsc, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    app::{Command, CommandError, CommandResponse, ReplyContext},
+    app::{Command, CommandError, CommandResponse, ReplyContext, Request},
     message::Outgoing,
 };
 
@@ -36,7 +36,8 @@ pub enum TransportErr {
     /// The reply channel closed. Cannot happen while [`Transport::forward`] holds its sender.
     #[error("response sender dropped: {0}")]
     SenderDropped(&'static str),
-    /// The node is stopping; nobody is to be answered.
+    /// The node is stopping and the request was abandoned; the peer may or may not have executed
+    /// it.
     #[error("transport cancelled")]
     Cancelled,
     /// The output task is gone, so the node can't send anything. Fatal.
@@ -45,6 +46,10 @@ pub enum TransportErr {
     /// The peer replied with a non-retryable error, passed on to the client as is.
     #[error("peer replied with a non-retryable error: {0:?}")]
     Remote(CommandError),
+    /// The peer replied with a response to another kind of command. A bug on either node; the
+    /// request may or may not have been executed.
+    #[error("peer replied with a response of a wrong type")]
+    UnexpectedResponse,
 }
 
 impl TransportErr {
@@ -102,6 +107,15 @@ pub struct Transport {
     replies: Arc<ReplyCache>,
 }
 
+/// Outcome of [`Transport::deduplicate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// A new request: execute it.
+    First,
+    /// A retry of a known request: already answered from the cache or dropped.
+    Duplicate,
+}
+
 enum Waited {
     Done(Result<CommandResponse, TransportErr>),
     Retry,
@@ -119,7 +133,7 @@ impl Transport {
         }
     }
 
-    /// Sends `command` to the peer `dest` and waits for its reply, retrying until
+    /// Sends `request` to the peer `dest` and waits for its reply, retrying until
     /// [`RpcConfig::deadline`].
     ///
     /// Every attempt carries the same request id, so the peer executes the command at most
@@ -131,9 +145,27 @@ impl Transport {
     ///
     /// - [`TransportErr::Timeout`] if no reply came before the deadline.
     /// - [`TransportErr::Remote`] if the peer replied with a non-retryable error.
+    /// - [`TransportErr::UnexpectedResponse`] if the reply is not a `Q::Response`.
     /// - [`TransportErr::Cancelled`] if `token` was cancelled.
     /// - [`TransportErr::ChanSend`] if the output task is gone.
-    pub async fn forward(
+    pub async fn forward<Q: Request>(
+        &self,
+        token: &CancellationToken,
+        dest: &str,
+        request: Q,
+    ) -> Result<Q::Response, TransportErr> {
+        let response = self.forward_command(token, dest, request.into()).await?;
+        Q::Response::try_from(response).map_err(|response| {
+            tracing::error!(
+                dest,
+                ?response,
+                "peer replied with a response of a wrong type"
+            );
+            TransportErr::UnexpectedResponse
+        })
+    }
+
+    async fn forward_command(
         &self,
         token: &CancellationToken,
         dest: &str,
@@ -187,23 +219,22 @@ impl Transport {
         }
     }
 
-    /// Returns whether the command must be executed.
-    ///
-    /// Commands from clients and read-only commands from peers are always executed. A retry of
-    /// a peer write that already completed is answered with the remembered reply instead; a
-    /// retry of one still in progress, or of one the peer no longer waits for, is dropped.
+    /// Commands from clients and read-only commands from peers are always [`Delivery::First`].
+    /// A retry of a peer write that already completed is answered here with the remembered
+    /// reply; a retry of one still in progress, or of one the peer no longer waits for, is
+    /// dropped.
     ///
     /// # Errors
     ///
     /// [`TransportErr::ChanSend`] if replaying a remembered reply fails because the output task
     /// is gone.
-    pub async fn admit(&self, reply_ctx: &ReplyContext) -> Result<bool, TransportErr> {
+    pub async fn deduplicate(&self, reply_ctx: &ReplyContext) -> Result<Delivery, TransportErr> {
         let Some(request) = deduplicated(reply_ctx.request) else {
-            return Ok(true);
+            return Ok(Delivery::First);
         };
 
         match self.replies.admit(&reply_ctx.dest, request) {
-            Admission::Execute => Ok(true),
+            Admission::Execute => Ok(Delivery::First),
             Admission::Replay(response) => {
                 tracing::debug!(origin = %reply_ctx.dest, seq = request.id.seq, "replaying reply to a retried request");
                 self.write(Outgoing::ForwardReply {
@@ -214,15 +245,15 @@ impl Transport {
                     dest: reply_ctx.dest.clone(),
                 })
                 .await?;
-                Ok(false)
+                Ok(Delivery::Duplicate)
             }
             Admission::InProgress => {
                 tracing::debug!(origin = %reply_ctx.dest, seq = request.id.seq, "dropping retry of a request in progress");
-                Ok(false)
+                Ok(Delivery::Duplicate)
             }
             Admission::Stale => {
                 tracing::debug!(origin = %reply_ctx.dest, seq = request.id.seq, "dropping request no longer awaited");
-                Ok(false)
+                Ok(Delivery::Duplicate)
             }
         }
     }
@@ -355,14 +386,14 @@ mod tests {
 
     use crate::{
         app::{
-            Command, CommandError, CommandResponse, CommitOffsetsRes, ErrorKind, ReplyContext,
-            SendCommand, SendRes,
+            CommandError, CommandResponse, CommitOffsetsRes, ErrorKind, ReplyContext, SendCommand,
+            SendRes,
         },
         message::Outgoing,
         transport::{PeerRequest, RequestId},
     };
 
-    use super::{RpcConfig, Transport, TransportErr};
+    use super::{Delivery, RpcConfig, Transport, TransportErr};
 
     fn config() -> RpcConfig {
         // short real intervals: tokio's paused clock needs the `test-util` feature
@@ -374,17 +405,17 @@ mod tests {
         }
     }
 
-    fn send_command() -> Command {
-        Command::Send(SendCommand {
+    fn send_command() -> SendCommand {
+        SendCommand {
             key: "log".to_owned(),
             msg: Bytes::from_static(b"7"),
-        })
+        }
     }
 
     fn spawn_forward(
         transport: &Transport,
         token: &CancellationToken,
-    ) -> tokio::task::JoinHandle<Result<CommandResponse, TransportErr>> {
+    ) -> tokio::task::JoinHandle<Result<SendRes, TransportErr>> {
         let transport = transport.clone();
         let token = token.clone();
         tokio::spawn(async move { transport.forward(&token, "n2", send_command()).await })
@@ -416,10 +447,20 @@ mod tests {
         transport.register_reply(msg_id, Ok(CommandResponse::Send(SendRes { offset: 4 })));
 
         let response = task.await.expect("forward task must complete");
-        assert!(matches!(
-            response,
-            Ok(CommandResponse::Send(SendRes { offset: 4 }))
-        ));
+        assert!(matches!(response, Ok(SendRes { offset: 4 })));
+    }
+
+    #[tokio::test]
+    async fn forward_rejects_response_of_wrong_type() {
+        let (write_tx, mut write_rx) = mpsc::channel(4);
+        let transport = Transport::new(write_tx, config(), 1);
+        let task = spawn_forward(&transport, &CancellationToken::new());
+
+        let (msg_id, _) = next_attempt(&mut write_rx).await;
+        transport.register_reply(msg_id, Ok(CommandResponse::CommitOffsets(CommitOffsetsRes)));
+
+        let response = task.await.expect("forward task must complete");
+        assert!(matches!(response, Err(TransportErr::UnexpectedResponse)));
     }
 
     #[tokio::test]
@@ -441,10 +482,7 @@ mod tests {
         );
 
         let response = task.await.expect("forward task must complete");
-        assert!(matches!(
-            response,
-            Ok(CommandResponse::Send(SendRes { offset: 9 }))
-        ));
+        assert!(matches!(response, Ok(SendRes { offset: 9 })));
     }
 
     #[tokio::test]
@@ -533,7 +571,7 @@ mod tests {
         let (write_tx, mut write_rx) = mpsc::channel(4);
         let transport = Transport::new(write_tx, config(), 1);
 
-        assert!(transport.admit(&peer_ctx(10)).await.expect("admit"));
+        assert_eq!(delivery(&transport, peer_ctx(10)).await, Delivery::First);
         transport
             .reply(CommandResponse::Send(SendRes { offset: 3 }), peer_ctx(10))
             .await
@@ -547,7 +585,10 @@ mod tests {
         ));
 
         // the retry is not executed, the reply is sent again to the new attempt
-        assert!(!transport.admit(&peer_ctx(11)).await.expect("admit"));
+        assert_eq!(
+            delivery(&transport, peer_ctx(11)).await,
+            Delivery::Duplicate
+        );
         assert!(matches!(
             write_rx.recv().await,
             Some(Outgoing::ForwardReply {
@@ -563,18 +604,14 @@ mod tests {
         let (write_tx, mut write_rx) = mpsc::channel(4);
         let transport = Transport::new(write_tx, config(), 1);
 
-        assert!(
-            transport
-                .admit(&read_only_peer_ctx(10))
-                .await
-                .expect("admit")
+        assert_eq!(
+            delivery(&transport, read_only_peer_ctx(10)).await,
+            Delivery::First
         );
         // a retry while the first attempt is still running is executed too
-        assert!(
-            transport
-                .admit(&read_only_peer_ctx(11))
-                .await
-                .expect("admit")
+        assert_eq!(
+            delivery(&transport, read_only_peer_ctx(11)).await,
+            Delivery::First
         );
         transport
             .reply(
@@ -592,12 +629,17 @@ mod tests {
         ));
 
         // nothing was remembered: a later retry is executed again, nothing is replayed
-        assert!(
-            transport
-                .admit(&read_only_peer_ctx(12))
-                .await
-                .expect("admit")
+        assert_eq!(
+            delivery(&transport, read_only_peer_ctx(12)).await,
+            Delivery::First
         );
         assert!(write_rx.try_recv().is_err());
+    }
+
+    async fn delivery(transport: &Transport, reply_ctx: ReplyContext) -> Delivery {
+        transport
+            .deduplicate(&reply_ctx)
+            .await
+            .expect("deduplicated")
     }
 }

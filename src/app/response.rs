@@ -36,50 +36,6 @@ pub struct ListCommittedOffsetsRes {
     pub offsets: HashMap<String, u64>,
 }
 
-impl TryFrom<CommandResponse> for SendRes {
-    type Error = CommandResponse;
-
-    fn try_from(response: CommandResponse) -> Result<Self, Self::Error> {
-        match response {
-            CommandResponse::Send(res) => Ok(res),
-            response => Err(response),
-        }
-    }
-}
-
-impl TryFrom<CommandResponse> for PollRes {
-    type Error = CommandResponse;
-
-    fn try_from(response: CommandResponse) -> Result<Self, Self::Error> {
-        match response {
-            CommandResponse::Poll(res) => Ok(res),
-            response => Err(response),
-        }
-    }
-}
-
-impl TryFrom<CommandResponse> for CommitOffsetsRes {
-    type Error = CommandResponse;
-
-    fn try_from(response: CommandResponse) -> Result<Self, Self::Error> {
-        match response {
-            CommandResponse::CommitOffsets(res) => Ok(res),
-            response => Err(response),
-        }
-    }
-}
-
-impl TryFrom<CommandResponse> for ListCommittedOffsetsRes {
-    type Error = CommandResponse;
-
-    fn try_from(response: CommandResponse) -> Result<Self, Self::Error> {
-        match response {
-            CommandResponse::ListCommittedOffsets(res) => Ok(res),
-            response => Err(response),
-        }
-    }
-}
-
 /// Error reply to a command, sent to a client or received from a peer.
 #[derive(Debug, Clone)]
 pub struct CommandError {

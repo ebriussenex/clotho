@@ -10,36 +10,8 @@ use tokio::{
 use tokio_util::{bytes::Bytes, sync::CancellationToken, task::TaskTracker};
 
 /// Errors of the log storage.
-///
-/// Only [`Self::ShuttingDown`] and [`Self::InternalError`] are produced now; the other variants
-/// are reserved for replication and not returned yet.
 #[derive(Debug, Error)]
 pub enum StorageErr {
-    /// Reserved for replication: an offset beyond the end of the log.
-    #[error("invalid offset requested: current: {current}, requested: {requested}")]
-    InvalidOffset { current: usize, requested: usize },
-    /// Reserved for replication: a replica has different data at the same offset.
-    #[error("merge conflict: existing: {existing}, received: {received}, offset: {offset}")]
-    ConflictingData {
-        existing: String,
-        received: String,
-        offset: usize,
-    },
-    /// Reserved for replication.
-    #[error("sender dropped")]
-    SenderDropped,
-    /// Reserved for replication.
-    #[error("receiver dropped")]
-    ReceiverDropped,
-    /// Reserved for replication: the topic has no log on this node.
-    #[error("requested topic not found")]
-    TopicNotFound,
-    /// Reserved for replication.
-    #[error("actor error: {0}")]
-    Actor(#[from] ActorErr),
-    /// Reserved for replication: a storage task panicked.
-    #[error("task panicked: {0}")]
-    TaskPanicked(#[from] tokio::task::JoinError),
     /// The storage is shutting down and accepts no appends. The append was not applied.
     #[error("storage is shutting down")]
     ShuttingDown,
@@ -47,23 +19,6 @@ pub enum StorageErr {
     /// A bug.
     #[error("internal error: partition actor died")]
     InternalError,
-}
-
-/// Reserved for replication: errors of partition actors. Not produced yet.
-#[derive(Debug, Error)]
-pub enum ActorErr {
-    /// The caller stopped waiting for the reply.
-    #[error("response receiver hang up early")]
-    HangUpEarly,
-    /// The request channel closed.
-    #[error("sender dropped")]
-    SenderDropped,
-    /// The reply channel closed.
-    #[error("receiver dropped")]
-    ReceiverDropped,
-    /// The actor task ended.
-    #[error("actor gone")]
-    ActorGone,
 }
 
 pub struct StoreConfig {
@@ -164,13 +119,14 @@ impl Store {
         result
     }
 
-    /// Waits for the partition actors to finish the appends they already accepted. New appends
-    /// are refused once the shutdown token is cancelled.
+    /// Stops accepting appends and waits for the partition actors to finish the ones they
+    /// already accepted.
     ///
     /// # Errors
     ///
     /// [`Elapsed`] if the actors didn't finish within the grace period.
     pub async fn shutdown(&self) -> Result<(), Elapsed> {
+        self.shutdown_token.cancel();
         self.tasks.close();
         tokio::time::timeout(self.config.grace_duration, self.tasks.wait()).await
     }
@@ -245,7 +201,6 @@ struct PartitionActor {
     active: Arc<ArcSwap<ActiveSegment>>,
 
     segment_size: usize,
-    base_offset: usize,
 
     shutdown_token: CancellationToken,
 }
@@ -282,7 +237,6 @@ impl PartitionActor {
             receiver,
             sealed,
             active,
-            base_offset: 0,
             segment_size,
             shutdown_token,
         }
@@ -495,5 +449,26 @@ mod tests {
 
         let polled = store.poll([("t".to_owned(), 1), ("other".to_owned(), 0)], 10);
         assert!(polled.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_finishes_accepted_appends_and_refuses_new_ones() {
+        let store = store(2);
+        for i in 0..3 {
+            store.append("t", entry(i)).await.expect("appended");
+        }
+
+        // nobody cancelled the storage token: shutdown stops the actors itself
+        tokio::time::timeout(Duration::from_secs(1), store.shutdown())
+            .await
+            .expect("shutdown doesn't wait for the grace period")
+            .expect("actors finished");
+
+        assert!(matches!(
+            store.append("t", entry(3)).await,
+            Err(StorageErr::ShuttingDown)
+        ));
+        let polled = store.poll([("t".to_owned(), 0)], 10);
+        assert_eq!(polled["t"], (0, (0..3).map(entry).collect::<Vec<_>>()));
     }
 }

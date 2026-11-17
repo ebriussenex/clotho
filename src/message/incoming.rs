@@ -17,19 +17,13 @@ pub enum Incoming {
     CommandReply(CommandReply),
 }
 
-/// Why a message is dropped without a reply.
 pub enum DropReason {
-    /// A command without `msg_id` can't be replied to.
     NoMsgId,
-    /// A reply without `in_reply_to` can't be matched to a request.
     NoInReplyTo,
-    /// A reply of the client protocol: the node never sends client requests, so none is awaited.
     ClientReply,
 }
 
 impl Msg<Payload> {
-    /// Splits a message into a command to execute or a reply to a request of this node.
-    ///
     /// # Errors
     ///
     /// The [`DropReason`] if the message can't be handled and must be dropped.
@@ -96,7 +90,12 @@ impl From<ForwardedResponse> for CommandResponse {
         match response {
             ForwardedResponse::SendOk { offset } => CommandResponse::Send(SendRes { offset }),
             ForwardedResponse::PollOk { msgs } => CommandResponse::Poll(PollRes {
-                msgs: super::map_msgs(msgs, |msg| msg.0),
+                msgs: msgs
+                    .into_iter()
+                    .map(|(key, (from, msgs))| {
+                        (key, (from, msgs.into_iter().map(|msg| msg.0).collect()))
+                    })
+                    .collect(),
             }),
             ForwardedResponse::CommitOffsetsOk => CommandResponse::CommitOffsets(CommitOffsetsRes),
             ForwardedResponse::ListCommittedOffsetsOk { offsets } => {
