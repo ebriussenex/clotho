@@ -8,29 +8,35 @@ use crate::{
     transport::{self, RpcConfig, Transport, TransportErr},
 };
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use thiserror::Error;
 use tokio::{
+    signal::unix::{SignalKind, signal},
     sync::mpsc::{self, error::TrySendError},
-    task::JoinSet,
+    task::{JoinError, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
 
 /// Error that stopped the node.
 #[derive(Debug, Error)]
 pub enum NodeErr {
+    /// SIGINT or SIGTERM can't be listened to, so the node could not be stopped gracefully.
+    /// Returned before the node starts.
+    #[error("can't listen for stop signals: {0}")]
+    Signal(#[source] std::io::Error),
     /// One of the node's tasks failed.
     #[error(transparent)]
     Handle(#[from] HandleErr),
 }
 
-/// Failure of one of the node's tasks (reader, writer, app). Stops the whole node.
+/// Failure of a task spawned by [`run`]: [`receive_and_dispatch`], [`write`](fn@write) or
+/// [`App::run`]. Stops the whole node.
 #[derive(Debug, Error)]
 pub enum HandleErr {
-    /// The app stopped taking commands.
-    #[error("failed to send to {channel} channel")]
-    ChanSend { channel: &'static str },
+    /// A task spawned by [`run`] ended without returning a result: it panicked or was aborted.
+    #[error("node task ended abnormally: {0}")]
+    Join(#[from] JoinError),
     /// The app failed.
     #[error(transparent)]
     App(#[from] AppErr),
@@ -43,23 +49,14 @@ pub enum HandleErr {
     Io(#[from] IoError),
 }
 
-impl HandleErr {
-    fn chan_send<T>(channel: &'static str) -> Self {
-        tracing::error!(
-            channel,
-            payload_type = std::any::type_name::<T>(),
-            "channel send failed"
-        );
-        Self::ChanSend { channel }
-    }
-}
-
 pub struct Config {
     poll_max_msgs_size: usize,
     rpc: RpcConfig,
     max_in_flight_commands: usize,
     command_queue_capacity: usize,
     ownership_seed: u64,
+    /// How long the node may take to stop once cancelled; then its tasks are aborted.
+    shutdown_grace: Duration,
 }
 
 impl Default for Config {
@@ -70,15 +67,20 @@ impl Default for Config {
             max_in_flight_commands: 64,
             command_queue_capacity: 32,
             ownership_seed: 0,
+            shutdown_grace: Duration::from_secs(10),
         }
     }
 }
 
-/// Runs the node until the input ends, a task fails, or Ctrl-C.
+/// Runs the node until the input ends, a task fails, or SIGINT / SIGTERM arrives, then stops it
+/// gracefully: [`receive_and_dispatch`] stops reading, [`App::run`] answers or rejects the
+/// commands it holds, [`write`](fn@write) writes all replies. Tasks still running after
+/// [`Config::shutdown_grace`] are aborted.
 ///
 /// # Errors
 ///
-/// The first [`HandleErr`] of the reader, writer, or app task. The other tasks are aborted.
+/// - [`NodeErr::Signal`] if SIGINT or SIGTERM can't be listened to; the node doesn't start.
+/// - [`NodeErr::Handle`] with the first error of a task, returned after the node stopped.
 pub async fn run<R, W>(
     config: Config,
     node_id: &str,
@@ -90,10 +92,13 @@ where
     R: MessageReader,
     W: MessageWriter,
 {
+    let mut interrupt = signal(SignalKind::interrupt()).map_err(NodeErr::Signal)?;
+    let mut terminate = signal(SignalKind::terminate()).map_err(NodeErr::Signal)?;
+
     let (write_tx, write_rx) = mpsc::channel(32);
     let (command_tx, command_rx) = mpsc::channel(config.command_queue_capacity.max(1));
 
-    let mut join_set = JoinSet::new();
+    let mut node_tasks = JoinSet::new();
     let token = CancellationToken::new();
     let transport = Transport::new(write_tx, config.rpc, transport::new_incarnation());
     let logs = Store::new(StoreConfig::default(), token.child_token());
@@ -105,21 +110,19 @@ where
     );
 
     let node_id: Arc<str> = Arc::from(node_id);
+    let shutdown_grace = config.shutdown_grace;
 
-    join_set.spawn({
+    node_tasks.spawn({
         let token = token.clone();
         let transport = transport.clone();
         async move { receive_and_dispatch(token, command_tx, transport, reader).await }
     });
 
-    join_set.spawn({
-        let token = token.clone();
-        async move { write(token, writer, write_rx, node_id.as_ref()).await }
-    });
+    node_tasks.spawn(async move { write(writer, write_rx, node_id.as_ref()).await });
 
-    join_set.spawn({
+    // NOTE: the app gets the last `transport`: the writer finishes once the reader and the app are gone
+    node_tasks.spawn({
         let token = token.clone();
-        let transport = transport.clone();
 
         async move {
             App::new(
@@ -136,28 +139,38 @@ where
         }
     });
 
-    tokio::select! {
+    let outcome: Result<(), HandleErr> = tokio::select! {
         biased;
 
         result = async {
-            while let Some(res) = join_set.join_next().await {
-                if let Ok(Err(e)) = res {
-                    return Err(e);
-                }
+            while let Some(joined) = node_tasks.join_next().await {
+                joined.map_err(HandleErr::from).flatten()?;
             }
             Ok(())
-        } => {
-            result?;
+        } => result,
+        _ = interrupt.recv() => Ok(()),
+        _ = terminate.recv() => Ok(()),
+    };
+
+    // stop gracefully in every case, a failed task included: the others still answer what they
+    // can
+    token.cancel();
+    let stopped = tokio::time::timeout(shutdown_grace, async {
+        while let Some(joined) = node_tasks.join_next().await {
+            if let Err(e) = joined.map_err(HandleErr::from).flatten() {
+                tracing::warn!(error = %e, "node task failed while stopping");
+            }
         }
-        _ = tokio::signal::ctrl_c() => {
-            token.cancel();
-        }
+    })
+    .await;
+    if stopped.is_err() {
+        tracing::warn!(
+            ?shutdown_grace,
+            "node did not stop in time, aborting its tasks"
+        );
     }
 
-    token.cancel();
-    while join_set.join_next().await.is_some() {}
-
-    Ok(())
+    Ok(outcome?)
 }
 
 async fn receive_and_dispatch(
@@ -217,8 +230,10 @@ async fn dispatch(
                     let error = CommandError::new(ErrorKind::Unavailable, "node is overloaded");
                     Ok(transport.reply_error(error, command.reply_ctx).await?)
                 }
-                Err(TrySendError::Closed(_)) => {
-                    Err(HandleErr::chan_send::<AppCommand>("command_tx"))
+                // the app is stopping: the command was not executed
+                Err(TrySendError::Closed(command)) => {
+                    let error = CommandError::new(ErrorKind::Unavailable, "node is shutting down");
+                    Ok(transport.reply_error(error, command.reply_ctx).await?)
                 }
             }
         }
@@ -242,25 +257,21 @@ async fn dispatch(
     }
 }
 
+/// Writes messages until every producer is gone, so replies produced while the node stops are
+/// still written.
+///
+/// # Errors
+///
+/// [`HandleErr::Io`] if a message can't be serialized or written.
 async fn write(
-    token: CancellationToken,
     mut writer: impl MessageWriter,
     mut write_rx: mpsc::Receiver<message::Outgoing>,
     node_id: &str,
 ) -> Result<(), HandleErr> {
-    loop {
-        let msg = tokio::select! {
-            biased;
-
-            _ = token.cancelled() => return Ok(()),
-            msg = write_rx.recv() => msg,
-        };
-
-        match msg {
-            Some(msg) => writer.send(msg.into_msg(node_id.as_ref())).await?,
-            None => return Ok(()),
-        }
+    while let Some(msg) = write_rx.recv().await {
+        writer.send(msg.into_msg(node_id)).await?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -399,5 +410,147 @@ mod tests {
 
         assert!(command_rx.try_recv().is_err());
         assert!(write_rx.try_recv().is_err());
+    }
+
+    /// Reads the given lines, then reports the end of input.
+    struct LinesReader(std::collections::VecDeque<String>);
+
+    impl crate::io::MessageReader for LinesReader {
+        async fn next<'a, T: serde::de::DeserializeOwned + 'a>(
+            &'a mut self,
+        ) -> Result<Option<Msg<T>>, crate::io::IoError> {
+            let Some(line) = self.0.pop_front() else {
+                return Ok(None);
+            };
+            serde_json::from_str(&line)
+                .map(Some)
+                .map_err(|source| crate::io::IoError::Malformed {
+                    src: None,
+                    msg_id: None,
+                    source,
+                })
+        }
+    }
+
+    /// Collects written messages as JSON.
+    #[derive(Clone, Default)]
+    struct CollectingWriter(std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>);
+
+    impl crate::io::MessageWriter for CollectingWriter {
+        async fn send<T: serde::Serialize + Send>(
+            &mut self,
+            msg: Msg<T>,
+        ) -> Result<(), crate::io::IoError> {
+            let value = serde_json::to_value(&msg).expect("serializable");
+            self.0.lock().expect("not poisoned").push(value);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn node_stops_at_end_of_input_after_writing_replies() {
+        let reader = LinesReader(
+            [
+                r#"{"src":"c1","dest":"n1","body":{"type":"send","msg_id":1,"key":"k","msg":7}}"#,
+                r#"{"src":"c1","dest":"n1","body":{"type":"poll","msg_id":2,"offsets":{"k":0}}}"#,
+            ]
+            .map(str::to_owned)
+            .into(),
+        );
+        let writer = CollectingWriter::default();
+
+        let run = super::run(super::Config::default(), "n1", &[], reader, writer.clone());
+        tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("node stops at the end of input")
+            .expect("no node error");
+
+        let written = writer.0.lock().expect("not poisoned").clone();
+        let types: Vec<_> = written
+            .iter()
+            .map(|msg| msg["body"]["type"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(types.len(), 2, "{written:?}");
+        assert!(types.contains(&"send_ok".to_owned()), "{written:?}");
+        assert!(types.contains(&"poll_ok".to_owned()), "{written:?}");
+    }
+
+    #[tokio::test]
+    async fn writer_writes_queued_messages_until_producers_are_gone() {
+        let (write_tx, write_rx) = mpsc::channel(4);
+        for in_reply_to in 1..=3 {
+            write_tx
+                .send(Outgoing::ErrorReply {
+                    msg_id: in_reply_to,
+                    error: CommandError::new(ErrorKind::Unavailable, "x"),
+                    in_reply_to,
+                    dest: "c1".to_owned(),
+                })
+                .await
+                .expect("queued");
+        }
+        drop(write_tx);
+
+        let writer = CollectingWriter::default();
+        super::write(writer.clone(), write_rx, "n1")
+            .await
+            .expect("written");
+
+        assert_eq!(writer.0.lock().expect("not poisoned").len(), 3);
+    }
+
+    #[tokio::test]
+    async fn closed_queue_rejects_command_with_unavailable() {
+        let (transport, mut write_rx) = transport();
+        let (command_tx, command_rx) = mpsc::channel(1);
+        drop(command_rx);
+
+        dispatch(client_send(1), &command_tx, &transport)
+            .await
+            .expect("not a node failure");
+
+        assert!(matches!(
+            write_rx.try_recv(),
+            Ok(Outgoing::ErrorReply {
+                in_reply_to: 1,
+                error: CommandError {
+                    kind: ErrorKind::Unavailable,
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+
+    /// Fails every write.
+    struct FailingWriter;
+
+    impl crate::io::MessageWriter for FailingWriter {
+        async fn send<T: serde::Serialize + Send>(
+            &mut self,
+            _msg: Msg<T>,
+        ) -> Result<(), crate::io::IoError> {
+            let error = std::io::Error::other("broken pipe");
+            Err(crate::io::stdio::StdioErr::Write(error).into())
+        }
+    }
+
+    #[tokio::test]
+    async fn node_stops_and_reports_a_failed_task() {
+        let reader = LinesReader(
+            [r#"{"src":"c1","dest":"n1","body":{"type":"send","msg_id":1,"key":"k","msg":7}}"#]
+                .map(str::to_owned)
+                .into(),
+        );
+
+        let run = super::run(super::Config::default(), "n1", &[], reader, FailingWriter);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("node stops after a task failed");
+
+        assert!(matches!(
+            result,
+            Err(super::NodeErr::Handle(super::HandleErr::Io(_)))
+        ));
     }
 }

@@ -108,13 +108,30 @@ impl App {
         if result.is_err() {
             handlers_token.cancel();
         }
+        app.reject_queued(&mut command_rx).await;
         while let Some(joined) = handlers.join_next().await {
             if let Err(e) = joined.map_err(AppErr::from).flatten() {
                 tracing::warn!(error = %e, "command handler failed while app was stopping");
             }
         }
+        if app.logs.shutdown().await.is_err() {
+            tracing::warn!("log storage did not finish accepted appends in time");
+        }
 
         result
+    }
+
+    /// Answers the commands still queued with
+    /// [`ErrorKind::Unavailable`]: they were not executed, so the sender may retry them.
+    async fn reject_queued(&self, command_rx: &mut mpsc::Receiver<AppCommand>) {
+        command_rx.close();
+        while let Some(command) = command_rx.recv().await {
+            let error = CommandError::new(ErrorKind::Unavailable, "node is shutting down");
+            if let Err(e) = self.transport.reply_error(error, command.reply_ctx).await {
+                tracing::warn!(error = %e, "can't reject a queued command");
+                return;
+            }
+        }
     }
 
     async fn handle(&self, token: &CancellationToken, command: AppCommand) -> Result<(), AppErr> {
@@ -692,5 +709,50 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn stopping_app_rejects_queued_commands() {
+        let (write_tx, mut write_rx) = mpsc::channel(8);
+        let transport = Transport::new(write_tx, RpcConfig::default(), 1);
+        let app = App::new(
+            Store::new(StoreConfig::default(), CancellationToken::new()),
+            transport,
+            CommittedOffsets::new(),
+            Ownership::new("n1".to_owned(), [], 0),
+            100,
+            1,
+        );
+        let (command_tx, command_rx) = mpsc::channel(4);
+        for in_reply_to in 1..=3 {
+            let command = AppCommand {
+                reply_ctx: ReplyContext {
+                    dest: "c1".to_owned(),
+                    in_reply_to,
+                    request: None,
+                },
+                kind: poll(&[("k", 0)]),
+                source: CommandSource::Client,
+            };
+            command_tx.send(command).await.expect("queued");
+        }
+
+        // stopped before it took any command
+        let token = CancellationToken::new();
+        token.cancel();
+        app.run(token, command_rx).await.expect("no app error");
+
+        for _ in 1..=3 {
+            assert!(matches!(
+                write_rx.recv().await,
+                Some(Outgoing::ErrorReply {
+                    error: CommandError {
+                        kind: ErrorKind::Unavailable,
+                        ..
+                    },
+                    ..
+                })
+            ));
+        }
     }
 }

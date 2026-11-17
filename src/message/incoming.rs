@@ -17,19 +17,13 @@ pub enum Incoming {
     CommandReply(CommandReply),
 }
 
-/// Why a message is dropped without a reply.
 pub enum DropReason {
-    /// A command without `msg_id` can't be replied to.
     NoMsgId,
-    /// A reply without `in_reply_to` can't be matched to a request.
     NoInReplyTo,
-    /// A reply of the client protocol: the node never sends client requests, so none is awaited.
     ClientReply,
 }
 
 impl Msg<Payload> {
-    /// Splits a message into a command to execute or a reply to a request of this node.
-    ///
     /// # Errors
     ///
     /// The [`DropReason`] if the message can't be handled and must be dropped.
